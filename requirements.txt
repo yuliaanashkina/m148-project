@@ -1,0 +1,3 @@
+polars
+matplotlib
+pandas
