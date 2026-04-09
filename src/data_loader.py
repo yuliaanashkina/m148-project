@@ -63,7 +63,11 @@ print("Task 2.2 - Rows after removing duplicates:", num_rows_clean)
 ## task 3
 
 # sample
-df_sample = df.head(100000).collect()
+unique_ids = df.select("id").unique().collect()
+# sample 100k ids
+sample_ids = unique_ids.sample(n=100000, shuffle=True)
+# filter full df by sampled ids
+df_sample = df.filter(pl.col("id").is_in(sample_ids["id"])).collect()
 
 # parse timestamp once
 df_sample = df_sample.with_columns(
