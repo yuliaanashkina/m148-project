@@ -1,0 +1,167 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\title{CTMC Submission Pipeline}
+\author{M148 Capstone Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+
+The Kaggle task requires one probability per open journey:
+\[
+\Pr(\texttt{order\_shipped}=1 \mid \text{observed journey so far}).
+\]
+The required submission format is
+\begin{verbatim}
+id,order_shipped
+-1000001271 551641434,0.1
+-100001164 -1710062169,0.95
+\end{verbatim}
+
+The CTMC pipeline writes this exact two-column format.  The standalone script
+writes under \texttt{data/submissions/} by default, while the exploration
+notebook writes run outputs under \texttt{results/}.  The script is
+\texttt{src/ctmc\_submission.py}.
+
+\section{Training Data}
+
+The CTMC models use the checkpointed event data produced by
+\texttt{src/run\_data\_pipeline.py}.  In particular, the main input is
+\texttt{data/journeys\_flattened.parquet}, where each journey has an ordered
+list of pairs
+\[
+(t_m, s_m),
+\]
+with timestamp \(t_m\) and action state \(s_m=\texttt{ed\_id}\).
+
+From each journey, the CTMC pipeline constructs observed transitions
+\[
+(i,j,\Delta t)=(s_m,s_{m+1},t_{m+1}-t_m).
+\]
+The success state is
+\[
+s^\star = 28,
+\]
+which corresponds to \texttt{order\_shipped}.
+
+\section{Method 1: Global CTMC}
+
+The global model estimates a single generator matrix \(Q\) from all training
+journeys.  For each transition \(i\to j\), define
+\[
+N_{ij}=\#\{m:s_m=i, s_{m+1}=j\}
+\]
+and
+\[
+T_i=\sum_{m:s_m=i}(t_{m+1}-t_m).
+\]
+The off-diagonal transition rates are estimated as
+\[
+q_{ij}=\frac{N_{ij}}{T_i}, \qquad i\neq j.
+\]
+The diagonal is set so each row sums to zero:
+\[
+q_{ii}=-\sum_{j\neq i}q_{ij}.
+\]
+
+For prediction, \texttt{order\_shipped} is treated as an absorbing success
+state by setting its row in \(Q\) to zero.  Given current state \(s\), the
+submission probability is
+\[
+\Pr(\text{success by }60\text{ days}\mid s)
+= \left[\exp(Q_{\mathrm{abs}}\,h)\right]_{s,s^\star},
+\]
+where \(h=60\cdot24\cdot60\cdot60\) seconds.
+
+\section{Method 2: Clustered CTMC}
+
+The segmented model first clusters journeys without using the purchase label.
+Features include:
+
+\begin{itemize}[leftmargin=*]
+\item action counts and proportions,
+\item total observed time and average inter-action gap,
+\item time spent in common states,
+\item first and current action,
+\item time to key actions when observed.
+\end{itemize}
+
+After clustering, the pipeline fits one generator matrix per segment:
+\[
+Q^{(k)}, \qquad k=1,\ldots,K.
+\]
+For an open test journey, the same leakage-safe features are computed, the
+cluster is predicted, and the probability is
+\[
+\left[\exp(Q^{(k)}_{\mathrm{abs}}h)\right]_{s,s^\star}.
+\]
+
+\section{Method 3: Neural Exponential-Rate CTMC}
+
+The neural model estimates a customer-dependent success intensity directly.  It
+does not predict the next state.  Given journey features \(x\), it learns
+\(\lambda(x)\) and uses the exponential waiting-time model
+\[
+\Pr(T_{\mathrm{success}}\le t\mid x)=1-\exp(-\lambda(x)t).
+\]
+
+Successful training snapshots use the observed remaining time to
+\texttt{order\_shipped} when available.  Incomplete snapshots are treated as
+censored at the 60-day horizon with a small baseline hazard.  The resulting
+probability is written directly in the Kaggle format.
+
+\section{Outputs}
+
+When \texttt{data/open\_journeys1.csv} is present, run:
+\begin{verbatim}
+python src/ctmc_submission.py
+\end{verbatim}
+
+The standalone script writes:
+\begin{itemize}[leftmargin=*]
+\item \texttt{data/submissions/ctmc\_global\_submission.csv}
+\item \texttt{data/submissions/ctmc\_clustered\_submission.csv}
+\item \texttt{data/submissions/ctmc\_neural\_rate\_submission.csv}
+\item \texttt{data/submissions/ctmc\_blend\_submission.csv}
+\end{itemize}
+
+The notebook writes the same CTMC files to \texttt{results/}, along with
+tabular Random Forest and XGBoost submissions.
+
+If \texttt{data/open\_journeys1\_flattened\_all0.csv} is available, it is used
+only to match the official Kaggle row order.  If it is missing but
+\texttt{data/open\_journeys1.csv} is present, the script creates an all-zero
+template with the required \texttt{id,order\_shipped} columns from the unique
+open journey IDs.
+
+\section{Comparison to Existing Random Forest}
+
+The existing Random Forest submission path trains on truncated journey
+features and writes the same columns:
+\[
+\texttt{id},\quad \texttt{order\_shipped}.
+\]
+The CTMC notebook now includes a comparison cell that plots CTMC variants
+against logistic regression, gradient boosting, and random forest baselines.
+The official Kaggle comparison should still be made with held-out or submitted
+test scores, because notebook scores are internal validation metrics.
+
+\section{Important Caveat}
+
+The flattened all-zero file is not a feature table; it is an output template.
+The CTMC features come from the open journey event history.  Therefore the CTMC
+submission script needs \texttt{open\_journeys1.csv}, or an equivalent event file
+with at least:
+\[
+\texttt{id},\quad \texttt{event\_timestamp},\quad \texttt{ed\_id}.
+\]
+
+\end{document}
