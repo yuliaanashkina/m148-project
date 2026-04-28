@@ -27,14 +27,14 @@ id,order_shipped
 \end{verbatim}
 
 The CTMC pipeline writes this exact two-column format.  The standalone script
-writes under \texttt{data/submissions/} by default, while the exploration
+writes under \texttt{results/submissions/} by default, while the exploration
 notebook writes run outputs under \texttt{results/}.  The script is
-\texttt{src/ctmc\_submission.py}.
+\texttt{src/models/ctmc\_submission.py}.
 
 \section{Training Data}
 
 The CTMC models use the checkpointed event data produced by
-\texttt{src/run\_data\_pipeline.py}.  In particular, the main input is
+\texttt{src/data\_engineering/}.  In particular, the main input is
 \texttt{data/journeys\_flattened.parquet}, where each journey has an ordered
 list of pairs
 \[
@@ -122,15 +122,15 @@ probability is written directly in the Kaggle format.
 
 When \texttt{data/open\_journeys1.csv} is present, run:
 \begin{verbatim}
-python src/ctmc_submission.py
+python src/models/ctmc_submission.py
 \end{verbatim}
 
 The standalone script writes:
 \begin{itemize}[leftmargin=*]
-\item \texttt{data/submissions/ctmc\_global\_submission.csv}
-\item \texttt{data/submissions/ctmc\_clustered\_submission.csv}
-\item \texttt{data/submissions/ctmc\_neural\_rate\_submission.csv}
-\item \texttt{data/submissions/ctmc\_blend\_submission.csv}
+\item \texttt{results/submissions/ctmc\_global\_submission.csv}
+\item \texttt{results/submissions/ctmc\_clustered\_submission.csv}
+\item \texttt{results/submissions/ctmc\_neural\_rate\_submission.csv}
+\item \texttt{results/submissions/ctmc\_blend\_submission.csv}
 \end{itemize}
 
 The notebook writes the same CTMC files to \texttt{results/}, along with

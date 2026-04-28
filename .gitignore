@@ -1,7 +1,26 @@
 venv/
+.venv/
+.codex_deps/
 __pycache__/
 .ipynb_checkpoints/
 .env
 .DS_Store
 *.pyc
-data/
+
+# Local data and generated artifacts are intentionally not versioned.
+data/*
+!data/.gitkeep
+!data/raw/
+!data/raw/.gitkeep
+!data/cleaned/
+!data/cleaned/.gitkeep
+!data/feature_engineered/
+!data/feature_engineered/.gitkeep
+results/*
+!results/.gitkeep
+!results/benchmarks/
+!results/benchmarks/.gitkeep
+!results/submissions/
+!results/submissions/.gitkeep
+!results/artifacts/
+!results/artifacts/.gitkeep
