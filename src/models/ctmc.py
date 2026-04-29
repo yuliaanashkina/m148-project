@@ -85,14 +85,18 @@ class CTMCData:
             ]
         )
 
+        # Pre-filter labeled journeys to only the IDs in base before exploding.
+        # Without this, exploding all 1.27M journeys (~63M events) then joining
+        # is ~20x slower than joining first (to ~75k IDs) then exploding.
+        base_ids = base.select(["id", "snapshot_num_actions"])
         snapshot_times = (
             pl.scan_parquet(self.labeled_path)
             .select(["id", "journey", "end_time"])
+            .join(base_ids, on="id", how="inner")
             .explode("journey")
             .unnest("journey")
             .sort(["id", "event_timestamp", "ed_id"])
             .with_columns(pl.int_range(1, pl.len() + 1).over("id").alias("action_num"))
-            .join(base.select(["id", "snapshot_num_actions"]), on="id", how="inner")
             .filter(pl.col("action_num") == pl.col("snapshot_num_actions"))
             .select(["id", pl.col("event_timestamp").alias("snapshot_time"), "end_time"])
         )
