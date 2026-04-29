@@ -485,15 +485,16 @@ class NeuralRateCTMC:
     """
     Neural exponential-rate CTMC for direct success timing.
 
-    This model does not predict the next state. It estimates a personalized
-    success intensity lambda(x) and uses the exponential waiting-time model
+    Estimates a personalized success intensity lambda(x) via a MLP trained on
+    the censored exponential log-likelihood:
 
-        P(T_success <= t | x) = 1 - exp(-lambda(x) t).
+        Uncensored (label=1):  log lambda - lambda * t_event
+        Censored   (label=0):  -lambda * t_horizon
 
-    The target rate is derived from truncated journey snapshots. Successful
-    rows use the observed remaining time to order_shipped when available;
-    incomplete rows are treated as censored at the 60-day horizon with a small
-    baseline hazard.
+    This correctly treats incomplete journeys as right-censored observations
+    rather than assigning them a fictitious tiny hazard rate.
+
+    P(T_success <= t | x) = 1 - exp(-lambda(x) t).
     """
 
     def __init__(
@@ -501,18 +502,28 @@ class NeuralRateCTMC:
         hidden_layer_sizes: tuple[int, ...] = (64, 32),
         horizon_seconds: float = 60 * 24 * 60 * 60,
         random_state: int = 42,
+        lr: float = 1e-3,
+        max_epochs: int = 200,
+        patience: int = 10,
+        batch_size: int = 512,
     ) -> None:
         self.hidden_layer_sizes = hidden_layer_sizes
         self.horizon_seconds = horizon_seconds
         self.random_state = random_state
-        self.pipeline_ = None
+        self.lr = lr
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.batch_size = batch_size
+        self.net_ = None
+        self.imputer_ = None
+        self.scaler_ = None
         self.feature_columns_: list[str] = []
 
     def fit(self, training_df: pd.DataFrame) -> "NeuralRateCTMC":
-        from sklearn.compose import TransformedTargetRegressor
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
         from sklearn.impute import SimpleImputer
-        from sklearn.neural_network import MLPRegressor
-        from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
 
         data = training_df.copy()
@@ -520,48 +531,85 @@ class NeuralRateCTMC:
             data = data.drop(columns=["prefix_actions"])
 
         self.feature_columns_ = [
-            c for c in data.columns if c not in {"id", "label", "final_outcome", "remaining_time_to_success_seconds"}
+            c for c in data.columns
+            if c not in {"id", "label", "final_outcome", "remaining_time_to_success_seconds"}
         ]
 
+        self.imputer_ = SimpleImputer(strategy="median")
+        self.scaler_ = StandardScaler()
+        X = self.scaler_.fit_transform(
+            self.imputer_.fit_transform(data[self.feature_columns_])
+        ).astype("float32")
+
+        labels = data["label"].to_numpy(dtype="float32")
+
+        # Event times: for successes use time-to-event; for censored use horizon.
         if "remaining_time_to_success_seconds" in data.columns:
-            remaining = data["remaining_time_to_success_seconds"].to_numpy(dtype=float)
-            positive_time = np.maximum(remaining, 1.0)
+            remaining = data["remaining_time_to_success_seconds"].fillna(0).to_numpy(dtype=float)
+            event_times = np.where(labels == 1, np.maximum(remaining, 1.0), float(self.horizon_seconds))
         else:
-            positive_time = np.maximum(data.get("prefix_duration_seconds", self.horizon_seconds), 1.0)
+            event_times = np.full(len(labels), float(self.horizon_seconds))
+        event_times = event_times.astype("float32")
 
-        labels = data["label"].to_numpy(dtype=int)
-        target_rate = np.where(
-            labels == 1,
-            1.0 / positive_time,
-            1.0 / (10.0 * self.horizon_seconds),
+        # MLP: output = log(lambda), so lambda = exp(output) is always positive.
+        torch.manual_seed(self.random_state)
+        dims = [X.shape[1]] + list(self.hidden_layer_sizes)
+        layers: list[nn.Module] = []
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(in_d, out_d), nn.ReLU()]
+        layers.append(nn.Linear(dims[-1], 1))
+        net = nn.Sequential(*layers)
+
+        optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, weight_decay=1e-4)
+
+        X_t = torch.from_numpy(X)
+        ev_t = torch.from_numpy(event_times).unsqueeze(1)
+        lab_t = torch.from_numpy(labels).unsqueeze(1)
+
+        loader = DataLoader(
+            TensorDataset(X_t, lab_t, ev_t),
+            batch_size=self.batch_size,
+            shuffle=True,
         )
 
-        regressor = Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    MLPRegressor(
-                        hidden_layer_sizes=self.hidden_layer_sizes,
-                        random_state=self.random_state,
-                        max_iter=300,
-                        early_stopping=True,
-                    ),
-                ),
-            ]
-        )
+        best_loss = float("inf")
+        best_state: dict | None = None
+        stalled = 0
 
-        self.pipeline_ = TransformedTargetRegressor(
-            regressor=regressor,
-            func=np.log,
-            inverse_func=np.exp,
-        )
-        self.pipeline_.fit(data[self.feature_columns_], np.clip(target_rate, 1e-12, None))
+        for _ in range(self.max_epochs):
+            net.train()
+            for xb, lb, tb in loader:
+                optimizer.zero_grad()
+                log_lam = net(xb)
+                lam = torch.exp(log_lam).clamp(min=1e-12)
+                ll = lb * (log_lam - lam * tb) + (1 - lb) * (-lam * tb)
+                (-ll.mean()).backward()
+                optimizer.step()
+
+            net.eval()
+            with torch.no_grad():
+                log_lam = net(X_t)
+                lam = torch.exp(log_lam).clamp(min=1e-12)
+                val_loss = -(lab_t * (log_lam - lam * ev_t) + (1 - lab_t) * (-lam * ev_t)).mean().item()
+
+            if val_loss + 1e-5 < best_loss:
+                best_loss = val_loss
+                best_state = {k: v.clone() for k, v in net.state_dict().items()}
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled >= self.patience:
+                    break
+
+        if best_state is not None:
+            net.load_state_dict(best_state)
+        self.net_ = net
         return self
 
     def predict_lambda(self, rows: pd.DataFrame) -> np.ndarray:
-        if self.pipeline_ is None:
+        import torch
+
+        if self.net_ is None:
             raise RuntimeError("Call fit() before predicting neural rates.")
         x = rows.copy()
         if "prefix_actions" in x.columns:
@@ -569,8 +617,13 @@ class NeuralRateCTMC:
         for col in self.feature_columns_:
             if col not in x.columns:
                 x[col] = 0
-        rates = self.pipeline_.predict(x[self.feature_columns_])
-        return np.clip(np.asarray(rates, dtype=float), 1e-12, None)
+        X = self.scaler_.transform(
+            self.imputer_.transform(x[self.feature_columns_])
+        ).astype("float32")
+        self.net_.eval()
+        with torch.no_grad():
+            log_lam = self.net_(torch.from_numpy(X)).numpy().ravel()
+        return np.clip(np.exp(log_lam), 1e-12, None)
 
     def predict_success_probability(
         self,
