@@ -79,28 +79,50 @@ def preprocess_arrays(x_train: pd.DataFrame, x_valid: pd.DataFrame):
     return x_train_np.astype("float32"), x_valid_np.astype("float32")
 
 
-def tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials: int, random_state: int):
-    from xgboost import XGBClassifier
+def tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials: int, random_state: int, device: str = "cpu"):
+    import xgboost as xgb
+
+    # Build DMatrix once so GPU memory is allocated once across all trials.
+    dtrain = xgb.DMatrix(x_train, label=y_train.to_numpy())
+    dvalid = xgb.DMatrix(x_valid, label=y_valid.to_numpy())
 
     def objective(trial: optuna.Trial) -> float:
-        model = XGBClassifier(
-            n_estimators=trial.suggest_int("n_estimators", 150, 700),
-            max_depth=trial.suggest_int("max_depth", 2, 8),
-            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            subsample=trial.suggest_float("subsample", 0.6, 1.0),
-            colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            min_child_weight=trial.suggest_float("min_child_weight", 0.5, 12.0, log=True),
-            reg_alpha=trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-            reg_lambda=trial.suggest_float("reg_lambda", 1e-4, 20.0, log=True),
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=random_state,
-            n_jobs=-1,
+        params = {
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "device": device,
+            "seed": random_state,
+            # tree structure
+            "max_depth": trial.suggest_int("max_depth", 3, 10),
+            "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 64.0, log=True),
+            "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
+            "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 10.0),
+            # step size / regularisation
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 20.0, log=True),
+            # sampling
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.4, 1.0),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", 0.4, 1.0),
+        }
+
+        booster = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=3000,
+            evals=[(dvalid, "valid")],
+            early_stopping_rounds=50,
+            verbose_eval=False,
         )
-        model.fit(x_train, y_train)
-        probs = model.predict_proba(x_valid)[:, 1]
-        trial.set_user_attr("metrics", score_probs(y_valid, probs))
-        return score_probs(y_valid, probs)["log_loss"]
+
+        best_iter = int(booster.best_iteration)
+        probs = booster.predict(dvalid, iteration_range=(0, best_iter + 1))
+        metrics = score_probs(y_valid, probs)
+        trial.set_user_attr("metrics", metrics)
+        trial.set_user_attr("best_iteration", best_iter)
+        return metrics["log_loss"]
 
     return run_study("xgboost", objective, n_trials)
 
@@ -262,14 +284,14 @@ def save_trials(study: optuna.Study) -> None:
     pd.DataFrame(rows).to_csv(RESULTS_DIR / f"optuna_{study.study_name}_trials.csv", index=False)
 
 
-def run_tuning(max_rows: int, n_trials: int, models: list[str], random_state: int = 42) -> pd.DataFrame:
+def run_tuning(max_rows: int, n_trials: int, models: list[str], random_state: int = 42, device: str = "cpu") -> pd.DataFrame:
     RESULTS_DIR.mkdir(exist_ok=True)
     df = load_features(max_rows=max_rows)
     x_train, x_valid, y_train, y_valid = split_xy(df, random_state=random_state)
 
     studies = []
     if "xgboost" in models:
-        studies.append(tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials, random_state))
+        studies.append(tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials, random_state, device=device))
     if "hgb" in models or "hist_gradient_boosting" in models:
         studies.append(tune_hist_gradient_boosting(x_train, x_valid, y_train, y_valid, n_trials, random_state))
     if "rf" in models or "random_forest" in models:
@@ -295,9 +317,19 @@ def main() -> None:
         default=["xgboost", "hgb", "rf", "neural"],
         help="Any of: xgboost hgb rf neural",
     )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="XGBoost device: 'cpu' or 'cuda' (requires CUDA build of xgboost)",
+    )
     args = parser.parse_args()
 
-    summary = run_tuning(max_rows=args.max_rows, n_trials=args.n_trials, models=args.models)
+    summary = run_tuning(
+        max_rows=args.max_rows,
+        n_trials=args.n_trials,
+        models=args.models,
+        device=args.device,
+    )
     print(summary)
 
 
