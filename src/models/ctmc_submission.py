@@ -28,7 +28,12 @@ try:
         JourneyFeatureBuilder,
         NeuralRateCTMC,
     )
-    from .tabular_submission import build_open_journey_features
+    from .tabular_submission import (
+        build_open_journey_features,
+        brier_report,
+        calibrate_prevalence,
+        TEST_PREVALENCE,
+    )
 except ImportError:
     from ctmc import (
         CTMCData,
@@ -37,7 +42,12 @@ except ImportError:
         JourneyFeatureBuilder,
         NeuralRateCTMC,
     )
-    from tabular_submission import build_open_journey_features
+    from tabular_submission import (
+        build_open_journey_features,
+        brier_report,
+        calibrate_prevalence,
+        TEST_PREVALENCE,
+    )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -164,21 +174,40 @@ def create_ctmc_submissions(
     features = test_features_from_events(events, builder)
     neural_features = build_open_journey_features(test_events_path)
 
-    global_probs = global_ctmc.absorption_probability(
+    print(f"Test prevalence target: {TEST_PREVALENCE:.4f}  (all-zeros Brier baseline={TEST_PREVALENCE:.5f})")
+
+    global_probs_raw = global_ctmc.absorption_probability(
         features["current_state"],
         success_state=SUCCESS_STATE,
         horizon_seconds=HORIZON_SECONDS,
     )
-    clustered_probs = clustered_ctmc.predict_success_probability(
+    clustered_probs_raw = clustered_ctmc.predict_success_probability(
         features,
         success_state=SUCCESS_STATE,
         horizon_seconds=HORIZON_SECONDS,
         fallback_model=global_ctmc,
     )
-    neural_probs = neural_ctmc.predict_success_probability(
+    neural_probs_raw = neural_ctmc.predict_success_probability(
         neural_features,
         horizon_seconds=HORIZON_SECONDS,
     )
+
+    # blend raw probs first, then calibrate once — avoids compounding non-linear shifts
+    blended_raw = (
+        0.4 * global_probs_raw
+        + 0.4 * clustered_probs_raw
+        + 0.2 * neural_probs_raw
+    )
+
+    global_probs   = calibrate_prevalence(global_probs_raw)
+    clustered_probs = calibrate_prevalence(clustered_probs_raw)
+    neural_probs   = calibrate_prevalence(neural_probs_raw)
+    blended_probs  = calibrate_prevalence(blended_raw)
+
+    brier_report("global_ctmc",    global_probs)
+    brier_report("clustered_ctmc", clustered_probs)
+    brier_report("neural_ctmc",    neural_probs)
+    brier_report("blend_ctmc",     blended_probs)
 
     outputs = {
         "global": write_submission(
@@ -199,19 +228,13 @@ def create_ctmc_submissions(
             output_dir / "ctmc_neural_rate_submission.csv",
             sample_path=sample_path,
         ),
+        "blend": write_submission(
+            features["id"],
+            blended_probs,
+            output_dir / "ctmc_blend_submission.csv",
+            sample_path=None,
+        ),
     }
-
-    blended = (
-        0.4 * outputs["global"]["order_shipped"].to_numpy()
-        + 0.4 * outputs["clustered"]["order_shipped"].to_numpy()
-        + 0.2 * outputs["neural"]["order_shipped"].to_numpy()
-    )
-    outputs["blend"] = write_submission(
-        outputs["global"]["id"],
-        blended,
-        output_dir / "ctmc_blend_submission.csv",
-        sample_path=None,
-    )
 
     return outputs
 
