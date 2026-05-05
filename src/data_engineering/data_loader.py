@@ -1,6 +1,35 @@
+"""One-shot data engineering pipeline (tasks 1-7).
+
+This file runs the full data prep workflow as side effects at module
+top-level: it reads ``data/dat_train1.csv``, writes cleaned CSVs and
+parquets back into ``data/``, and renders figures into ``figures/``.
+Because every line below executes on import, this is a SCRIPT, not a
+module. Importing it from another file (or accidentally via Jupyter)
+will trigger the whole pipeline and crash if the raw data is absent.
+
+Run with ``python -m src.data_engineering.data_loader`` instead.
+"""
+
+from pathlib import Path
+
 import polars as pl
 
-DATA_PATH = "data/dat_train1.csv"
+if __name__ != "__main__":
+    raise ImportError(
+        "src.data_engineering.data_loader is a script with import-time "
+        "side effects. Run it directly (python -m "
+        "src.data_engineering.data_loader) instead of importing it."
+    )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+RESULTS_DIR = PROJECT_ROOT / "results"
+SUBMISSION_DIR = RESULTS_DIR / "submissions"
+FIGURE_DIR = PROJECT_ROOT / "figures"
+
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_PATH = DATA_DIR / "dat_train1.csv"
 
 # lazy load
 df = pl.scan_csv(DATA_PATH)
@@ -47,10 +76,10 @@ df_clean = df_clean.sort(["id", "event_timestamp"]).with_columns(
     pl.int_range(1, pl.len() + 1).over("id").alias("journey_steps_until_end")
 )
 
-df_clean.collect().write_csv("data/dat_train1_clean.csv")
+df_clean.collect().write_csv(DATA_DIR / "dat_train1_clean.csv")
 
 #2.2
-df_clean = pl.scan_csv("data/dat_train1_clean.csv")
+df_clean = pl.scan_csv(DATA_DIR / "dat_train1_clean.csv")
 
 num_rows_clean = df_clean.select(pl.len()).collect().item()
 
@@ -146,7 +175,7 @@ plt.xscale("log")
 plt.title("Journey Length Distribution (log scale)")
 plt.xlabel("Number of Actions")
 plt.ylabel("Frequency")
-plt.savefig("fig1_journey_length.png")
+plt.savefig(FIGURE_DIR / "fig1_journey_length.png")
 plt.show()
 plt.clf()
 
@@ -156,7 +185,7 @@ plt.xscale("log")
 plt.title("Time Between Actions (log scale in seconds)")
 plt.xlabel("Seconds")
 plt.ylabel("Frequency")
-plt.savefig("fig2_time_between.png")
+plt.savefig(FIGURE_DIR / "fig2_time_between.png")
 plt.show()
 plt.clf()
 
@@ -168,7 +197,7 @@ plt.title("Top 10 Most Common Actions")
 plt.xlabel("Action")
 plt.ylabel("Count")
 plt.xticks(rotation=45)
-plt.savefig("fig3_common_actions.png")
+plt.savefig(FIGURE_DIR / "fig3_common_actions.png")
 plt.show()
 plt.clf()
 
@@ -210,8 +239,8 @@ def flatten_journeys_parquet(input_csv_path, output_parquet_path):
 
     df.sink_parquet(output_parquet_path)
 
-training_csv_path = "data/dat_train1.csv"
-output_path = "data/journeys_flattened.parquet"
+training_csv_path = DATA_DIR / "dat_train1.csv"
+output_path = DATA_DIR / "journeys_flattened.parquet"
 
 flatten_journeys_parquet(training_csv_path, output_path)
 
@@ -236,7 +265,7 @@ print(df.head())
 ORDER_SHIPPED_ID = 999  # TODO: replace with the actual ed_id for "order shipped"
 
 # read flattened journeys from task 4
-journeys = pl.read_parquet("data/journeys_flattened.parquet")
+journeys = pl.read_parquet(DATA_DIR / "journeys_flattened.parquet")
 
 # get the latest timestamp in the full raw dataset
 dataset_end_time = (
@@ -262,7 +291,7 @@ import pandas as pd
 ORDER_SHIPPED_ID = 28  # replace if needed
 
 # read flattened journeys from task 4
-journeys = pl.read_parquet("data/journeys_flattened.parquet")
+journeys = pl.read_parquet(DATA_DIR / "journeys_flattened.parquet")
 
 # get the latest timestamp in the full raw dataset
 dataset_end_time = (
@@ -306,7 +335,7 @@ plt.xlabel("Journey Status")
 plt.ylabel("Count")
 plt.xticks(rotation=0)
 plt.tight_layout()
-plt.savefig("fig4_journey_status_counts.png")
+plt.savefig(FIGURE_DIR / "fig4_journey_status_counts.png")
 plt.show()
 plt.clf()
 
@@ -347,7 +376,7 @@ plt.suptitle("")
 plt.xlabel("Journey Type")
 plt.ylabel("Number of Actions")
 plt.tight_layout()
-plt.savefig("fig5_num_actions_boxplot.png")
+plt.savefig(FIGURE_DIR / "fig5_num_actions_boxplot.png")
 plt.show()
 plt.clf()
 
@@ -359,7 +388,7 @@ plt.xlabel("Journey Type")
 plt.ylabel("Duration (seconds)")
 plt.yscale("log")
 plt.tight_layout()
-plt.savefig("fig6_duration_boxplot.png")
+plt.savefig(FIGURE_DIR / "fig6_duration_boxplot.png")
 plt.show()
 plt.clf()
 
@@ -372,7 +401,7 @@ for status in ["successful", "incomplete"]:
     plt.ylabel("Frequency")
     plt.xscale("log")
     plt.tight_layout()
-    plt.savefig(f"fig7_num_actions_hist_{status}.png")
+    plt.savefig(FIGURE_DIR / f"fig7_num_actions_hist_{status}.png")
     plt.show()
     plt.clf()
 
@@ -385,7 +414,7 @@ for status in ["successful", "incomplete"]:
     plt.ylabel("Frequency")
     plt.xscale("log")
     plt.tight_layout()
-    plt.savefig(f"fig8_duration_hist_{status}.png")
+    plt.savefig(FIGURE_DIR / f"fig8_duration_hist_{status}.png")
     plt.show()
     plt.clf()
 
@@ -417,7 +446,7 @@ for status in ["successful", "incomplete"]:
     plt.ylabel("Count")
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(f"fig9_first_actions_{status}.png")
+    plt.savefig(FIGURE_DIR / f"fig9_first_actions_{status}.png")
     plt.show()
     plt.clf()
 
@@ -449,13 +478,13 @@ plt.xlabel("Last Action")
 plt.ylabel("Count")
 plt.xticks(rotation=45)
 plt.tight_layout()
-plt.savefig("fig10_incomplete_dropoff_actions.png")
+plt.savefig(FIGURE_DIR / "fig10_incomplete_dropoff_actions.png")
 plt.show()
 plt.clf()
 
 # optional: save labeled dataset
-journeys_labeled.write_parquet("data/journeys_labeled.parquet")
-print("\nSaved labeled journeys to data/journeys_labeled.parquet")
+journeys_labeled.write_parquet(DATA_DIR / "journeys_labeled.parquet")
+print(f"\nSaved labeled journeys to {DATA_DIR / 'journeys_labeled.parquet'}")
 
 
 ## task 6
@@ -579,15 +608,15 @@ print(top_actions)
 # --------------------------------------------------
 # 6.4 Save modeling dataset
 # --------------------------------------------------
-training_df.write_parquet("data/journey_training_optionA.parquet")
+training_df.write_parquet(DATA_DIR / "journey_training_optionA.parquet")
 
 # CSV cannot store nested list columns like prefix_actions
 training_df_csv = training_df.drop("prefix_actions")
-training_df_csv.write_csv("data/journey_training_optionA.csv")
+training_df_csv.write_csv(DATA_DIR / "journey_training_optionA.csv")
 
 print("\nSaved training data to:")
-print("data/journey_training_optionA.parquet")
-print("data/journey_training_optionA.csv")
+print(DATA_DIR / "journey_training_optionA.parquet")
+print(DATA_DIR / "journey_training_optionA.csv")
 
 # --------------------------------------------------
 # 6.5 Basic label balance check
@@ -610,7 +639,7 @@ import matplotlib.pyplot as plt
 # --------------------------------------------------
 # 7.1 Load training data
 # --------------------------------------------------
-df = pl.read_parquet("data/journey_training_optionA.parquet")
+df = pl.read_parquet(DATA_DIR / "journey_training_optionA.parquet")
 
 # drop nested column + anything not usable
 df_model = df.drop(["prefix_actions", "final_outcome"])
@@ -678,7 +707,7 @@ plt.gca().invert_yaxis()
 plt.title("Top Feature Importances (Random Forest)")
 plt.xlabel("Importance")
 plt.tight_layout()
-plt.savefig("fig11_feature_importance.png")
+plt.savefig(FIGURE_DIR / "fig11_feature_importance.png")
 plt.show()
 
 ## task 8
@@ -707,9 +736,10 @@ submission = pd.DataFrame({
 })
 
 # match requested format exactly
-submission.to_csv("data/kaggle_submission.csv", index=False)
+SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
+submission.to_csv(SUBMISSION_DIR / "kaggle_submission.csv", index=False)
 
-print("\nSaved submission file to data/kaggle_submission.csv")
+print(f"\nSaved submission file to {SUBMISSION_DIR / 'kaggle_submission.csv'}")
 print(submission.head())
 
 # optional: quick summary of predicted probabilities

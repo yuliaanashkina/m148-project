@@ -6,3 +6,4 @@ scikit-learn
 xgboost
 optuna
 torch
+ipykernel

@@ -28,7 +28,8 @@ id,order_shipped
 
 The CTMC pipeline writes this exact two-column format.  The standalone script
 writes under \texttt{results/submissions/} by default, while the exploration
-notebook writes run outputs under \texttt{results/}.  The script is
+notebook writes submissions under \texttt{results/submissions/} and benchmark
+tables under \texttt{results/benchmarks/}.  The script is
 \texttt{src/models/ctmc\_submission.py}.
 
 \section{Training Data}
@@ -133,8 +134,9 @@ The standalone script writes:
 \item \texttt{results/submissions/ctmc\_blend\_submission.csv}
 \end{itemize}
 
-The notebook writes the same CTMC files to \texttt{results/}, along with
-tabular Random Forest and XGBoost submissions.
+The notebook writes the same CTMC files to \texttt{results/submissions/}, along
+with tabular Random Forest and XGBoost submissions. Benchmark tables are written
+to \texttt{results/benchmarks/}.
 
 If \texttt{data/open\_journeys1\_flattened\_all0.csv} is available, it is used
 only to match the official Kaggle row order.  If it is missing but

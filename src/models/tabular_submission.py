@@ -19,6 +19,7 @@ import polars as pl
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 RESULTS_DIR = PROJECT_ROOT / "results"
+SUBMISSION_DIR = RESULTS_DIR / "submissions"
 
 TRAINING_PATH = DATA_DIR / "journey_training_optionA.parquet"
 DEFAULT_TEST_EVENTS = DATA_DIR / "open_journeys1.csv"
@@ -140,7 +141,7 @@ def write_submission(ids: pd.Series, probs: np.ndarray, output_path: Path, sampl
 def create_tabular_submissions(
     test_events_path: Path = DEFAULT_TEST_EVENTS,
     sample_path: Path = DEFAULT_SAMPLE,
-    output_dir: Path = RESULTS_DIR,
+    output_dir: Path = SUBMISSION_DIR,
     max_train_rows: int | None = 300_000,
 ) -> dict[str, pd.DataFrame]:
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -221,7 +222,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Create tabular Kaggle submissions.")
     parser.add_argument("--test-events", type=Path, default=DEFAULT_TEST_EVENTS)
     parser.add_argument("--sample", type=Path, default=DEFAULT_SAMPLE)
-    parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--output-dir", type=Path, default=SUBMISSION_DIR)
     parser.add_argument("--max-train-rows", type=int, default=300_000)
     args = parser.parse_args()
 

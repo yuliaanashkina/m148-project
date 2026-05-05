@@ -153,6 +153,41 @@ class CTMCData:
         )
         return transitions[["id", "state", "next_state", "dt_seconds"]]
 
+    def prefix_transition_table(self, max_rows: int | None = None) -> pd.DataFrame:
+        """Transition table from truncated journey prefixes — no label leakage.
+
+        Reconstructs events up to the 70%-snapshot cutpoint from journeys_labeled.parquet
+        so that current_state never reveals whether the journey reached the success state.
+        Use this instead of transition_table() when building CTMC evaluation features.
+        """
+        base = pl.scan_parquet(self.training_path).select(["id", "snapshot_num_actions"])
+        if max_rows is not None:
+            base = base.head(max_rows)
+        base_ids = base.collect().lazy()
+
+        events = (
+            pl.scan_parquet(self.labeled_path)
+            .select(["id", "journey"])
+            .join(base_ids, on="id", how="inner")
+            .explode("journey")
+            .unnest("journey")
+            .sort(["id", "event_timestamp", "ed_id"])
+            .with_columns(pl.int_range(1, pl.len() + 1).over("id").alias("action_num"))
+            .filter(pl.col("action_num") <= pl.col("snapshot_num_actions"))
+            .collect()
+        )
+        pdf = events.to_pandas()
+        pdf["event_timestamp"] = pd.to_datetime(pdf["event_timestamp"], utc=True)
+        pdf["next_state"] = pdf.groupby("id")["ed_id"].shift(-1)
+        pdf["next_timestamp"] = pdf.groupby("id")["event_timestamp"].shift(-1)
+        transitions = pdf.dropna(subset=["next_state", "next_timestamp"]).copy()
+        transitions["state"] = transitions["ed_id"].astype(int)
+        transitions["next_state"] = transitions["next_state"].astype(int)
+        transitions["dt_seconds"] = _as_seconds(
+            transitions["next_timestamp"] - transitions["event_timestamp"]
+        )
+        return transitions[["id", "state", "next_state", "dt_seconds"]]
+
 
 class GlobalCTMC:
     """Estimate a single global CTMC generator matrix Q."""
