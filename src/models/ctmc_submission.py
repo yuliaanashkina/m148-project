@@ -26,10 +26,8 @@ try:
         ClusteredCTMC,
         GlobalCTMC,
         JourneyFeatureBuilder,
-        NeuralRateCTMC,
     )
     from .tabular_submission import (
-        build_open_journey_features,
         brier_report,
         calibrate_prevalence,
         TEST_PREVALENCE,
@@ -40,10 +38,8 @@ except ImportError:
         ClusteredCTMC,
         GlobalCTMC,
         JourneyFeatureBuilder,
-        NeuralRateCTMC,
     )
     from tabular_submission import (
-        build_open_journey_features,
         brier_report,
         calibrate_prevalence,
         TEST_PREVALENCE,
@@ -136,8 +132,7 @@ def write_submission(
 def fit_training_ctmcs(
     max_train_journeys: int | None,
     n_clusters: int,
-    neural_transition_limit: int,
-) -> tuple[pd.DataFrame, GlobalCTMC, ClusteredCTMC, JourneyFeatureBuilder, NeuralRateCTMC]:
+) -> tuple[pd.DataFrame, GlobalCTMC, ClusteredCTMC, JourneyFeatureBuilder]:
     data = CTMCData()
     transitions = data.transition_table(max_journeys=max_train_journeys)
 
@@ -145,11 +140,7 @@ def fit_training_ctmcs(
     clustered_ctmc = ClusteredCTMC(n_clusters=n_clusters).fit(transitions)
     builder = clustered_ctmc.feature_builder
 
-    neural_training = data.load_neural_rate_training_features(max_rows=neural_transition_limit)
-    neural_ctmc = NeuralRateCTMC(hidden_layer_sizes=(64, 32), random_state=42)
-    neural_ctmc.fit(neural_training)
-
-    return transitions, global_ctmc, clustered_ctmc, builder, neural_ctmc
+    return transitions, global_ctmc, clustered_ctmc, builder
 
 
 def create_ctmc_submissions(
@@ -157,22 +148,19 @@ def create_ctmc_submissions(
     sample_path: Path = DEFAULT_SAMPLE,
     output_dir: Path = SUBMISSION_DIR,
     max_train_journeys: int | None = 100_000,
-    n_clusters: int = 4,
-    neural_transition_limit: int = 75_000,
+    n_clusters: int = 3,
 ) -> dict[str, pd.DataFrame]:
     events = load_test_events(test_events_path)
     if sample_path is not None and not sample_path.exists():
         write_flattened_all0_template(events, sample_path)
         print(f"Created Kaggle ID template: {sample_path}")
 
-    _, global_ctmc, clustered_ctmc, builder, neural_ctmc = fit_training_ctmcs(
+    _, global_ctmc, clustered_ctmc, builder = fit_training_ctmcs(
         max_train_journeys=max_train_journeys,
         n_clusters=n_clusters,
-        neural_transition_limit=neural_transition_limit,
     )
 
     features = test_features_from_events(events, builder)
-    neural_features = build_open_journey_features(test_events_path)
 
     print(f"Test prevalence target: {TEST_PREVALENCE:.4f}  (all-zeros Brier baseline={TEST_PREVALENCE:.5f})")
 
@@ -187,26 +175,15 @@ def create_ctmc_submissions(
         horizon_seconds=HORIZON_SECONDS,
         fallback_model=global_ctmc,
     )
-    neural_probs_raw = neural_ctmc.predict_success_probability(
-        neural_features,
-        horizon_seconds=HORIZON_SECONDS,
-    )
 
-    # blend raw probs first, then calibrate once — avoids compounding non-linear shifts
-    blended_raw = (
-        0.4 * global_probs_raw
-        + 0.4 * clustered_probs_raw
-        + 0.2 * neural_probs_raw
-    )
+    blended_raw = 0.5 * global_probs_raw + 0.5 * clustered_probs_raw
 
-    global_probs   = calibrate_prevalence(global_probs_raw)
+    global_probs    = calibrate_prevalence(global_probs_raw)
     clustered_probs = calibrate_prevalence(clustered_probs_raw)
-    neural_probs   = calibrate_prevalence(neural_probs_raw)
-    blended_probs  = calibrate_prevalence(blended_raw)
+    blended_probs   = calibrate_prevalence(blended_raw)
 
     brier_report("global_ctmc",    global_probs)
     brier_report("clustered_ctmc", clustered_probs)
-    brier_report("neural_ctmc",    neural_probs)
     brier_report("blend_ctmc",     blended_probs)
 
     outputs = {
@@ -220,12 +197,6 @@ def create_ctmc_submissions(
             features["id"],
             clustered_probs,
             output_dir / "ctmc_clustered_submission.csv",
-            sample_path=sample_path,
-        ),
-        "neural": write_submission(
-            neural_features["id"],
-            neural_probs,
-            output_dir / "ctmc_neural_rate_submission.csv",
             sample_path=sample_path,
         ),
         "blend": write_submission(
@@ -244,8 +215,7 @@ def main() -> None:
     parser.add_argument("--test-events", type=Path, default=DEFAULT_TEST_EVENTS)
     parser.add_argument("--sample", type=Path, default=DEFAULT_SAMPLE)
     parser.add_argument("--max-train-journeys", type=int, default=100_000)
-    parser.add_argument("--n-clusters", type=int, default=4)
-    parser.add_argument("--neural-transition-limit", type=int, default=75_000)
+    parser.add_argument("--n-clusters", type=int, default=3)
     parser.add_argument("--output-dir", type=Path, default=SUBMISSION_DIR)
     args = parser.parse_args()
 
@@ -255,7 +225,6 @@ def main() -> None:
         output_dir=args.output_dir,
         max_train_journeys=args.max_train_journeys,
         n_clusters=args.n_clusters,
-        neural_transition_limit=args.neural_transition_limit,
     )
     for name, df in outputs.items():
         print(f"{name}: {df.shape}")

@@ -16,9 +16,9 @@ import pandas as pd
 import polars as pl
 
 try:
-    from .ctmc import CTMCData, ClusteredCTMC, GlobalCTMC, NeuralRateCTMC
+    from .ctmc import CTMCData, ClusteredCTMC, GlobalCTMC
 except ImportError:
-    from ctmc import CTMCData, ClusteredCTMC, GlobalCTMC, NeuralRateCTMC
+    from ctmc import CTMCData, ClusteredCTMC, GlobalCTMC
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -128,8 +128,7 @@ def metrics(y_true: np.ndarray, scores: np.ndarray, predictions: np.ndarray, nam
     }
 
 
-def run_experiment(max_rows: int = 100_000, n_clusters: int = 4, neural_transition_limit: int = 50_000) -> pd.DataFrame:
-    data = CTMCData()
+def run_experiment(max_rows: int = 100_000, n_clusters: int = 4) -> pd.DataFrame:
     snapshots = load_snapshots(max_rows=max_rows)
     train_ids, test_ids = split_ids(snapshots)
 
@@ -140,11 +139,6 @@ def run_experiment(max_rows: int = 100_000, n_clusters: int = 4, neural_transiti
 
     global_ctmc = GlobalCTMC().fit(train_transitions)
     clustered_ctmc = ClusteredCTMC(n_clusters=n_clusters, random_state=42).fit(train_transitions)
-
-    neural_training = data.load_neural_rate_training_features(max_rows=max_rows)
-    neural_training = neural_training[neural_training["id"].isin(train_ids)].head(neural_transition_limit).copy()
-    neural_ctmc = NeuralRateCTMC(hidden_layer_sizes=(64, 32), random_state=42)
-    neural_ctmc.fit(neural_training)
 
     eval_features = snapshot_cluster_features(eval_snapshots, clustered_ctmc.feature_builder.top_actions_)
 
@@ -177,19 +171,6 @@ def run_experiment(max_rows: int = 100_000, n_clusters: int = 4, neural_transiti
     clustered_time_score = np.exp(-np.nan_to_num(clustered_times, nan=np.inf, posinf=1e12) / HORIZON_SECONDS)
     rows.append(metrics(y_true, clustered_time_score, clustered_time_pred, "clustered_expected_time_under_60d"))
 
-    neural_eval = eval_snapshots.drop(columns=["prefix_actions"], errors="ignore").copy()
-    neural_probs = neural_ctmc.predict_success_probability(
-        neural_eval,
-        horizon_seconds=HORIZON_SECONDS,
-    )
-    neural_prob_pred = (neural_probs >= 0.5).astype(int)
-    rows.append(metrics(y_true, neural_probs, neural_prob_pred, "neural_exponential_rate_probability"))
-
-    neural_times = neural_ctmc.predict_expected_success_time(neural_eval)
-    neural_time_pred = (neural_times <= HORIZON_SECONDS).astype(int)
-    neural_time_score = np.exp(-np.nan_to_num(neural_times, nan=np.inf, posinf=1e12) / HORIZON_SECONDS)
-    rows.append(metrics(y_true, neural_time_score, neural_time_pred, "neural_exponential_time_under_60d"))
-
     results = pd.DataFrame(rows).sort_values(["log_loss", "brier_score"])
     RESULTS_DIR.mkdir(exist_ok=True)
     results.to_csv(RESULTS_DIR / "ctmc_waiting_time_experiment.csv", index=False)
@@ -200,13 +181,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare CTMC probability vs waiting-time rules.")
     parser.add_argument("--max-rows", type=int, default=100_000)
     parser.add_argument("--n-clusters", type=int, default=4)
-    parser.add_argument("--neural-transition-limit", type=int, default=50_000)
     args = parser.parse_args()
 
     results = run_experiment(
         max_rows=args.max_rows,
         n_clusters=args.n_clusters,
-        neural_transition_limit=args.neural_transition_limit,
     )
     print(results)
 

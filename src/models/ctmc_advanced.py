@@ -1,10 +1,8 @@
 """
 Advanced CTMC methods for the M148 capstone.
 
-LaplaceGlobalCTMC      — Dirichlet-smoothed generator matrix (tames sparse-state noise)
-WeibullSemiMarkovCTMC  — Semi-Markov model with per-state Weibull holding times;
-                         absorption probability computed via Monte Carlo simulation
-CalibratedCTMC         — Post-hoc isotonic calibration wrapper (directly targets brier score)
+LaplaceGlobalCTMC  — Dirichlet-smoothed generator matrix (tames sparse-state noise)
+CalibratedCTMC     — Post-hoc isotonic calibration wrapper (directly targets brier score)
 
 These extend the baseline GlobalCTMC / ClusteredCTMC in ctmc.py and are compared
 against them in notebooks/benchmarks/ctmc_exploration.ipynb.
@@ -13,7 +11,6 @@ against them in notebooks/benchmarks/ctmc_exploration.ipynb.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -78,130 +75,7 @@ class LaplaceGlobalCTMC(GlobalCTMC):
 
 
 # ---------------------------------------------------------------------------
-# 2. WeibullSemiMarkovCTMC
-# ---------------------------------------------------------------------------
-
-class WeibullSemiMarkovCTMC:
-    """
-    Semi-Markov model with per-state Weibull holding times.
-
-    A standard CTMC constrains holding times to be exponential (memoryless).
-    Real customer dwell times are typically lognormal or Weibull (shape != 1).
-    This model:
-      1. Estimates the embedded Markov chain P_ij = N_ij / N_i from observed
-         transitions (direction of travel, independent of time).
-      2. Fits a Weibull distribution to holding times per state.
-      3. Estimates absorption probability via Monte Carlo simulation.
-
-    States with fewer than min_obs observations fall back to an exponential
-    (Weibull shape=1) parameterised by the global mean holding time.
-    """
-
-    def __init__(
-        self,
-        min_obs: int = 10,
-        n_sims: int = 300,
-        random_state: int = 42,
-    ) -> None:
-        self.min_obs = min_obs
-        self.n_sims = n_sims
-        self.random_state = random_state
-        self.states_: list[int] = []
-        self.embedded_P_: pd.DataFrame | None = None
-        self.weibull_params_: dict[int, tuple[float, float]] = {}  # state -> (shape, scale)
-
-    def fit(self, transitions: pd.DataFrame) -> "WeibullSemiMarkovCTMC":
-        from scipy.stats import weibull_min
-
-        df = transitions.copy()
-        df = df[df["state"] != df["next_state"]]
-
-        states = sorted(
-            set(df["state"].astype(int)).union(set(df["next_state"].astype(int)))
-        )
-        self.states_ = states
-
-        # Embedded Markov chain: row-normalised count matrix.
-        counts = pd.crosstab(df["state"], df["next_state"])
-        counts = counts.reindex(index=states, columns=states, fill_value=0)
-        row_sums = counts.sum(axis=1).replace(0, 1)
-        self.embedded_P_ = counts.div(row_sums, axis=0).astype(float)
-
-        # Per-state Weibull fit on holding times.
-        global_mean = float(df["dt_seconds"].mean()) or 1.0
-        for state in states:
-            times = df.loc[df["state"] == state, "dt_seconds"].to_numpy()
-            times = times[times > 0]
-            if len(times) >= self.min_obs:
-                try:
-                    shape, _, scale = weibull_min.fit(times, floc=0)
-                    self.weibull_params_[state] = (float(shape), float(scale))
-                except Exception:
-                    self.weibull_params_[state] = (1.0, global_mean)
-            else:
-                self.weibull_params_[state] = (1.0, global_mean)
-
-        return self
-
-    def _simulate_one(
-        self,
-        start_state: int,
-        success_state: int,
-        horizon: float,
-        rng: np.random.Generator,
-    ) -> bool:
-        from scipy.stats import weibull_min
-
-        state = start_state
-        t = 0.0
-        while True:
-            if state == success_state:
-                return True
-            shape, scale = self.weibull_params_.get(state, (1.0, 1.0))
-            dt = float(weibull_min.rvs(shape, scale=scale, loc=0, random_state=rng))
-            t += dt
-            if t > horizon:
-                return False
-            # Sample next state from embedded chain.
-            row = self.embedded_P_.loc[state] if state in self.embedded_P_.index else None
-            if row is None or row.sum() == 0:
-                return False
-            state = int(rng.choice(self.states_, p=row.to_numpy()))
-
-    def absorption_probability(
-        self,
-        current_states: Iterable[int],
-        success_state: int = 28,
-        horizon_seconds: float = 60 * 24 * 60 * 60,
-    ) -> np.ndarray:
-        if self.embedded_P_ is None:
-            raise RuntimeError("Call fit() before predicting absorption probabilities.")
-
-        rng = np.random.default_rng(self.random_state)
-        probs = []
-        for state in current_states:
-            hits = sum(
-                self._simulate_one(int(state), success_state, horizon_seconds, rng)
-                for _ in range(self.n_sims)
-            )
-            probs.append(hits / self.n_sims)
-        return np.clip(np.asarray(probs), 0.0, 1.0)
-
-    def predict_success_probability(
-        self,
-        features: pd.DataFrame,
-        success_state: int = 28,
-        horizon_seconds: float = 60 * 24 * 60 * 60,
-    ) -> np.ndarray:
-        return self.absorption_probability(
-            features["current_state"],
-            success_state=success_state,
-            horizon_seconds=horizon_seconds,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 3. CalibratedCTMC
+# 2. CalibratedCTMC
 # ---------------------------------------------------------------------------
 
 class CalibratedCTMC:
@@ -220,7 +94,7 @@ class CalibratedCTMC:
     probs = cal.predict(test_features)
     """
 
-    def __init__(self, base_model: GlobalCTMC | WeibullSemiMarkovCTMC) -> None:
+    def __init__(self, base_model: GlobalCTMC) -> None:
         self.base_model = base_model
         self.calibrator_ = None
 
@@ -280,7 +154,6 @@ def compare_advanced_models(
     horizon_seconds: float = 60 * 24 * 60 * 60,
     cal_frac: float = 0.3,
     random_state: int = 42,
-    weibull_n_sims: int = 300,
 ) -> pd.DataFrame:
     """
     Fit advanced CTMC variants and return a brier/AUC/logloss comparison table.
@@ -297,7 +170,6 @@ def compare_advanced_models(
     from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
     from sklearn.model_selection import train_test_split
 
-    # Split for calibration.
     idx_train, idx_cal = train_test_split(
         np.arange(len(features)), test_size=cal_frac, random_state=random_state, stratify=labels
     )
@@ -309,29 +181,19 @@ def compare_advanced_models(
 
     models: dict[str, np.ndarray] = {}
 
-    # Laplace-smoothed global CTMC
     laplace = LaplaceGlobalCTMC(alpha=0.5).fit(trans_train)
     models["laplace_global"] = laplace.absorption_probability(
         feat_cal["current_state"], success_state=success_state, horizon_seconds=horizon_seconds
     )
 
-    # Calibrated global CTMC
     base_global = GlobalCTMC().fit(trans_train)
     cal_global = CalibratedCTMC(base_global)
     cal_global.fit_calibration(feat_train, labels.iloc[idx_train], success_state, horizon_seconds)
     models["calibrated_global"] = cal_global.predict(feat_cal, success_state, horizon_seconds)
 
-    # Calibrated Laplace CTMC
     cal_laplace = CalibratedCTMC(laplace)
     cal_laplace.fit_calibration(feat_train, labels.iloc[idx_train], success_state, horizon_seconds)
     models["calibrated_laplace"] = cal_laplace.predict(feat_cal, success_state, horizon_seconds)
-
-    # Weibull semi-Markov (Monte Carlo — slower)
-    print("Fitting WeibullSemiMarkovCTMC (Monte Carlo, may take a moment)...")
-    weibull = WeibullSemiMarkovCTMC(n_sims=weibull_n_sims, random_state=random_state).fit(trans_train)
-    models["weibull_semi_markov"] = weibull.absorption_probability(
-        feat_cal["current_state"], success_state=success_state, horizon_seconds=horizon_seconds
-    )
 
     rows = []
     y = lab_cal.to_numpy()

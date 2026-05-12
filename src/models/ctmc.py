@@ -347,83 +347,158 @@ class JourneyFeatureBuilder:
         return self.transform(transitions)
 
     def transform(self, transitions: pd.DataFrame) -> pd.DataFrame:
-        rows = []
-        grouped = transitions.sort_values(["id"]).groupby("id", sort=False)
-        for user_id, g in grouped:
-            total_actions = len(g) + 1
-            total_time = float(g["dt_seconds"].sum())
-            row = {
-                "id": user_id,
-                "num_transitions": len(g),
-                "total_observed_time": total_time,
-                "avg_gap_seconds": total_time / max(len(g), 1),
-                "first_state": int(g["state"].iloc[0]),
-                "current_state": int(g["next_state"].iloc[-1]),
-            }
-            counts = g["state"].value_counts()
-            for action in self.top_actions_:
-                count = int(counts.get(action, 0))
-                row[f"action_count_{action}"] = count
-                row[f"action_prop_{action}"] = count / max(total_actions, 1)
-                row[f"time_in_state_{action}"] = float(
-                    g.loc[g["state"] == action, "dt_seconds"].sum()
-                )
-            for action in self.key_actions:
-                hit = g[g["next_state"] == action]
-                row[f"time_to_action_{action}"] = (
-                    float(g.loc[: hit.index[0], "dt_seconds"].sum()) if len(hit) else np.nan
-                )
-                row[f"seen_action_{action}"] = int(len(hit) > 0)
-            rows.append(row)
+        df = transitions.sort_values("id").copy()
 
-        features = pd.DataFrame(rows).fillna(-1)
-        return features
+        # Cumulative time within each journey — used for time_to_action_*.
+        df["_cumtime"] = df.groupby("id", sort=False)["dt_seconds"].cumsum()
+
+        # Base per-journey aggregates (one groupby pass).
+        base = (
+            df.groupby("id", sort=False)
+            .agg(
+                num_transitions=("state", "count"),
+                total_observed_time=("dt_seconds", "sum"),
+                first_state=("state", "first"),
+                current_state=("next_state", "last"),
+            )
+            .reset_index()
+        )
+        base["avg_gap_seconds"] = (
+            base["total_observed_time"] / base["num_transitions"].clip(lower=1)
+        )
+
+        # Action counts and dwell times — all top actions in two pivot ops.
+        act_sub = df[df["state"].isin(self.top_actions_)]
+        count_pivot = (
+            act_sub.groupby(["id", "state"])["state"].count()
+            .unstack(fill_value=0)
+            .rename(columns=lambda c: f"action_count_{c}")
+        )
+        time_pivot = (
+            act_sub.groupby(["id", "state"])["dt_seconds"].sum()
+            .unstack(fill_value=0.0)
+            .rename(columns=lambda c: f"time_in_state_{c}")
+        )
+        base = base.merge(count_pivot.reset_index(), on="id", how="left")
+        base = base.merge(time_pivot.reset_index(), on="id", how="left")
+
+        total_actions = base["num_transitions"] + 1  # states visited = transitions + 1
+        for action in self.top_actions_:
+            cc = f"action_count_{action}"
+            tc = f"time_in_state_{action}"
+            if cc not in base.columns:
+                base[cc] = 0
+            if tc not in base.columns:
+                base[tc] = 0.0
+            base[cc] = base[cc].fillna(0).astype(int)
+            base[tc] = base[tc].fillna(0.0)
+            base[f"action_prop_{action}"] = base[cc] / total_actions.clip(lower=1)
+
+        # Key action features — cumtime at first hit.
+        for action in self.key_actions:
+            hit = (
+                df[df["next_state"] == action]
+                .groupby("id", sort=False)["_cumtime"]
+                .first()
+                .rename(f"time_to_action_{action}")
+                .reset_index()
+            )
+            base = base.merge(hit, on="id", how="left")
+            base[f"seen_action_{action}"] = (
+                base[f"time_to_action_{action}"].notna().astype(int)
+            )
+
+        ordered = (
+            ["id", "num_transitions", "total_observed_time", "avg_gap_seconds",
+             "first_state", "current_state"]
+            + [c for a in self.top_actions_
+               for c in [f"action_count_{a}", f"action_prop_{a}", f"time_in_state_{a}"]]
+            + [c for a in self.key_actions
+               for c in [f"time_to_action_{a}", f"seen_action_{a}"]]
+        )
+        return base[[c for c in ordered if c in base.columns]].fillna(-1)
 
     def features_from_events(self, events: pd.DataFrame) -> pd.DataFrame:
-        """
-        Build the same leakage-safe feature surface from open/test journeys.
+        """Build the same feature surface from open/test event rows."""
+        df = events.sort_values(["id", "event_timestamp"]).copy()
 
-        Test journeys have no next observed state after their final action, so
-        gap-based summaries use within-prefix time differences only.
-        """
-        rows = []
-        for user_id, g in events.sort_values(["id", "event_timestamp"]).groupby("id", sort=False):
-            g = g.copy()
-            g["gap_seconds"] = (
-                g["event_timestamp"].diff().dt.total_seconds().clip(lower=0).fillna(0.0)
+        df["gap_seconds"] = (
+            df.groupby("id", sort=False)["event_timestamp"]
+            .diff()
+            .dt.total_seconds()
+            .clip(lower=0)
+            .fillna(0.0)
+        )
+        df["_cumtime"] = df.groupby("id", sort=False)["gap_seconds"].cumsum()
+
+        base = (
+            df.groupby("id", sort=False)
+            .agg(
+                total_actions=("ed_id", "count"),
+                total_observed_time=("gap_seconds", "sum"),
+                first_state=("ed_id", "first"),
+                current_state=("ed_id", "last"),
             )
-            total_actions = len(g)
-            total_time = float(g["gap_seconds"].sum())
-            row = {
-                "id": user_id,
-                "num_transitions": max(total_actions - 1, 0),
-                "total_observed_time": total_time,
-                "avg_gap_seconds": total_time / max(total_actions - 1, 1),
-                "first_state": int(g["ed_id"].iloc[0]),
-                "current_state": int(g["ed_id"].iloc[-1]),
-            }
-            counts = g["ed_id"].value_counts()
-            for action in self.top_actions_:
-                count = int(counts.get(action, 0))
-                row[f"action_count_{action}"] = count
-                row[f"action_prop_{action}"] = count / max(total_actions, 1)
-                row[f"time_in_state_{action}"] = float(
-                    g.loc[g["ed_id"] == action, "gap_seconds"].sum()
-                )
-            for action in self.key_actions:
-                hit = g[g["ed_id"] == action]
-                row[f"time_to_action_{action}"] = (
-                    float(g.loc[: hit.index[0], "gap_seconds"].sum()) if len(hit) else np.nan
-                )
-                row[f"seen_action_{action}"] = int(len(hit) > 0)
-            rows.append(row)
-        return pd.DataFrame(rows).fillna(-1)
+            .reset_index()
+        )
+        base["num_transitions"] = (base["total_actions"] - 1).clip(lower=0)
+        base["avg_gap_seconds"] = (
+            base["total_observed_time"] / base["num_transitions"].clip(lower=1)
+        )
+
+        act_sub = df[df["ed_id"].isin(self.top_actions_)]
+        count_pivot = (
+            act_sub.groupby(["id", "ed_id"])["ed_id"].count()
+            .unstack(fill_value=0)
+            .rename(columns=lambda c: f"action_count_{c}")
+        )
+        time_pivot = (
+            act_sub.groupby(["id", "ed_id"])["gap_seconds"].sum()
+            .unstack(fill_value=0.0)
+            .rename(columns=lambda c: f"time_in_state_{c}")
+        )
+        base = base.merge(count_pivot.reset_index(), on="id", how="left")
+        base = base.merge(time_pivot.reset_index(), on="id", how="left")
+
+        for action in self.top_actions_:
+            cc = f"action_count_{action}"
+            tc = f"time_in_state_{action}"
+            if cc not in base.columns:
+                base[cc] = 0
+            if tc not in base.columns:
+                base[tc] = 0.0
+            base[cc] = base[cc].fillna(0).astype(int)
+            base[tc] = base[tc].fillna(0.0)
+            base[f"action_prop_{action}"] = base[cc] / base["total_actions"].clip(lower=1)
+
+        for action in self.key_actions:
+            hit = (
+                df[df["ed_id"] == action]
+                .groupby("id", sort=False)["_cumtime"]
+                .first()
+                .rename(f"time_to_action_{action}")
+                .reset_index()
+            )
+            base = base.merge(hit, on="id", how="left")
+            base[f"seen_action_{action}"] = (
+                base[f"time_to_action_{action}"].notna().astype(int)
+            )
+
+        ordered = (
+            ["id", "num_transitions", "total_observed_time", "avg_gap_seconds",
+             "first_state", "current_state"]
+            + [c for a in self.top_actions_
+               for c in [f"action_count_{a}", f"action_prop_{a}", f"time_in_state_{a}"]]
+            + [c for a in self.key_actions
+               for c in [f"time_to_action_{a}", f"seen_action_{a}"]]
+        )
+        return base[[c for c in ordered if c in base.columns]].fillna(-1)
 
 
 class ClusteredCTMC:
     """Cluster journeys, then fit one GlobalCTMC generator per cluster."""
 
-    def __init__(self, n_clusters: int = 4, random_state: int = 42) -> None:
+    def __init__(self, n_clusters: int = 3, random_state: int = 42) -> None:
         self.n_clusters = n_clusters
         self.random_state = random_state
         self.feature_builder = JourneyFeatureBuilder()
@@ -431,6 +506,7 @@ class ClusteredCTMC:
         self.assignments_: pd.DataFrame | None = None
         self.pipeline_ = None
         self.feature_columns_: list[str] = []
+        self.cluster_columns_: list[str] = []
 
     def fit(self, transitions: pd.DataFrame) -> "ClusteredCTMC":
         from sklearn.cluster import KMeans
@@ -442,6 +518,14 @@ class ClusteredCTMC:
         x = features.drop(columns=["id"])
         self.feature_columns_ = x.columns.tolist()
 
+        # Cluster on action proportions + entry/current state only.
+        # This captures behavioral pattern (not journey intensity), giving
+        # clusters whose per-segment Q matrices differ in meaningful ways.
+        prop_cols = [c for c in x.columns if c.startswith("action_prop_")]
+        state_cols = [c for c in ["first_state", "current_state"] if c in x.columns]
+        cluster_cols = prop_cols + state_cols
+        self.cluster_columns_ = cluster_cols if cluster_cols else self.feature_columns_
+
         self.pipeline_ = Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
@@ -449,7 +533,7 @@ class ClusteredCTMC:
                 ("cluster", KMeans(n_clusters=self.n_clusters, random_state=self.random_state, n_init=10)),
             ]
         )
-        clusters = self.pipeline_.fit_predict(x)
+        clusters = self.pipeline_.fit_predict(x[self.cluster_columns_])
         assignments = features[["id"]].copy()
         assignments["cluster"] = clusters
         self.assignments_ = assignments
@@ -473,7 +557,8 @@ class ClusteredCTMC:
     def predict_clusters(self, features: pd.DataFrame) -> np.ndarray:
         if self.pipeline_ is None:
             raise RuntimeError("Call fit() before predicting clusters.")
-        return self.pipeline_.predict(features[self.feature_columns_])
+        cols = self.cluster_columns_ if self.cluster_columns_ else self.feature_columns_
+        return self.pipeline_.predict(features[cols])
 
     def predict_success_probability(
         self,
@@ -516,161 +601,272 @@ class ClusteredCTMC:
         return times
 
 
-class NeuralRateCTMC:
+class XGBoostRateCTMC:
     """
-    Neural exponential-rate CTMC for direct success timing.
+    CTMC with a XGBoost-predicted per-journey rate scaling factor.
 
-    Estimates a personalized success intensity lambda(x) via a MLP trained on
-    the censored exponential log-likelihood:
+    The global Q matrix (direction and relative rates between states) is kept
+    fixed. XGBoost predicts one scalar α per journey: how much faster or slower
+    that user transitions relative to the global average.
 
-        Uncensored (label=1):  log lambda - lambda * t_event
-        Censored   (label=0):  -lambda * t_horizon
+        Q(x) = α(x) · Q_global
+        P(absorbed by t | x, s) = expm(α(x) · Q_global · t)[s, success_state]
 
-    This correctly treats incomplete journeys as right-censored observations
-    rather than assigning them a fictitious tiny hazard rate.
+    α is estimated via proper MLE for the exponential holding-time model.
+    For journey j with transitions from state i having holding time t:
 
-    P(T_success <= t | x) = 1 - exp(-lambda(x) t).
+        α_j = n_j / Σ_ij (q_i · t_ij)
+
+    where q_i = -Q_global[i,i] is the global exit rate from state i.
+
+    Under this model α=1 recovers GlobalCTMC exactly. α>1 means the user
+    moves faster than average (higher absorption probability); α<1 means slower.
+
+    Training target: one log(α_j) per journey — low variance, well-identified.
+    Previous design trained on log(1/dt) per individual transition, which has
+    Var = π²/6 ≈ 1.65 regardless of the true rate — an irreducibly noisy target.
     """
 
     def __init__(
         self,
-        hidden_layer_sizes: tuple[int, ...] = (64, 32),
-        horizon_seconds: float = 60 * 24 * 60 * 60,
+        n_estimators: int = 400,
+        max_depth: int = 4,
+        learning_rate: float = 0.05,
+        subsample: float = 0.8,
+        colsample_bytree: float = 0.8,
         random_state: int = 42,
-        lr: float = 1e-3,
-        max_epochs: int = 200,
-        patience: int = 10,
-        batch_size: int = 512,
+        device: str = "auto",
     ) -> None:
-        self.hidden_layer_sizes = hidden_layer_sizes
-        self.horizon_seconds = horizon_seconds
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
         self.random_state = random_state
-        self.lr = lr
-        self.max_epochs = max_epochs
-        self.patience = patience
-        self.batch_size = batch_size
-        self.net_ = None
-        self.imputer_ = None
-        self.scaler_ = None
-        self.feature_columns_: list[str] = []
+        self.device = device
+        self.feature_builder = JourneyFeatureBuilder()
+        self.global_ctmc_: GlobalCTMC | None = None
+        self.scale_model_ = None
+        self.states_: list[int] = []
+        self.feature_cols_: list[str] = []
 
-    def fit(self, training_df: pd.DataFrame) -> "NeuralRateCTMC":
-        import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, TensorDataset
-        from sklearn.impute import SimpleImputer
-        from sklearn.preprocessing import StandardScaler
+    @staticmethod
+    def _resolve_device(requested: str) -> str:
+        if requested != "auto":
+            return requested
+        try:
+            import xgboost as xgb
+            dm = xgb.DMatrix([[0.0]], label=[0])
+            xgb.train({"device": "cuda", "verbosity": 0}, dm, num_boost_round=1)
+            print("  XGBoostRateCTMC: CUDA GPU detected, using device=cuda")
+            return "cuda"
+        except Exception:
+            print("  XGBoostRateCTMC: no CUDA GPU found, using device=cpu")
+            return "cpu"
 
-        data = training_df.copy()
-        if "prefix_actions" in data.columns:
-            data = data.drop(columns=["prefix_actions"])
+    def fit(self, transitions: pd.DataFrame) -> "XGBoostRateCTMC":
+        try:
+            from xgboost import XGBRegressor
+        except ImportError as exc:
+            raise ImportError("xgboost is required for XGBoostRateCTMC") from exc
 
-        self.feature_columns_ = [
-            c for c in data.columns
-            if c not in {"id", "label", "final_outcome", "remaining_time_to_success_seconds"}
-        ]
+        device = self._resolve_device(self.device)
 
-        self.imputer_ = SimpleImputer(strategy="median")
-        self.scaler_ = StandardScaler()
-        X = self.scaler_.fit_transform(
-            self.imputer_.fit_transform(data[self.feature_columns_])
-        ).astype("float32")
+        # Fit global CTMC — this defines Q_global and q_i for every state.
+        self.global_ctmc_ = GlobalCTMC().fit(transitions)
+        self.states_ = self.global_ctmc_.states_
 
-        labels = data["label"].to_numpy(dtype="float32")
+        # Global exit rate q_i = -Q_ii for each state.
+        q_by_state = {
+            s: max(float(-self.global_ctmc_.Q_.loc[s, s]), 1e-12)
+            for s in self.states_
+        }
 
-        # Event times: for successes use time-to-event; for censored use horizon.
-        if "remaining_time_to_success_seconds" in data.columns:
-            remaining = data["remaining_time_to_success_seconds"].fillna(0).to_numpy(dtype=float)
-            event_times = np.where(labels == 1, np.maximum(remaining, 1.0), float(self.horizon_seconds))
-        else:
-            event_times = np.full(len(labels), float(self.horizon_seconds))
-        event_times = event_times.astype("float32")
+        # Per-journey MLE of rate scale α:
+        #   α_j = n_j / Σ_{transitions in j} (q_{from_state} · dt_seconds)
+        # Under Exp(α · q_i), this is the exact MLE for α.
+        df = transitions[transitions["state"] != transitions["next_state"]].copy()
+        df["q_from"] = df["state"].map(q_by_state).fillna(0.0)
+        df["weighted_dt"] = df["q_from"] * df["dt_seconds"]
 
-        # MLP: output = log(lambda), so lambda = exp(output) is always positive.
-        torch.manual_seed(self.random_state)
-        dims = [X.shape[1]] + list(self.hidden_layer_sizes)
-        layers: list[nn.Module] = []
-        for in_d, out_d in zip(dims[:-1], dims[1:]):
-            layers += [nn.Linear(in_d, out_d), nn.ReLU()]
-        layers.append(nn.Linear(dims[-1], 1))
-        net = nn.Sequential(*layers)
-
-        optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, weight_decay=1e-4)
-
-        X_t = torch.from_numpy(X)
-        ev_t = torch.from_numpy(event_times).unsqueeze(1)
-        lab_t = torch.from_numpy(labels).unsqueeze(1)
-
-        loader = DataLoader(
-            TensorDataset(X_t, lab_t, ev_t),
-            batch_size=self.batch_size,
-            shuffle=True,
+        per_journey = (
+            df.groupby("id")
+            .agg(n_transitions=("dt_seconds", "count"),
+                 sum_weighted_dt=("weighted_dt", "sum"))
         )
+        per_journey["alpha"] = (
+            per_journey["n_transitions"] / per_journey["sum_weighted_dt"].clip(lower=1e-9)
+        )
+        per_journey["log_alpha"] = np.log(per_journey["alpha"].clip(lower=1e-6, upper=1e6))
 
-        best_loss = float("inf")
-        best_state: dict | None = None
-        stalled = 0
+        # Journey-level features (one row per journey).
+        journey_feats = self.feature_builder.fit_transform(transitions)
+        self.feature_cols_ = [c for c in journey_feats.columns if c != "id"]
 
-        for _ in range(self.max_epochs):
-            net.train()
-            for xb, lb, tb in loader:
-                optimizer.zero_grad()
-                log_lam = net(xb)
-                lam = torch.exp(log_lam).clamp(min=1e-12)
-                ll = lb * (log_lam - lam * tb) + (1 - lb) * (-lam * tb)
-                (-ll.mean()).backward()
-                optimizer.step()
+        train = journey_feats.merge(per_journey[["log_alpha"]], on="id", how="inner")
+        X = train[self.feature_cols_]
+        y = train["log_alpha"].to_numpy()
 
-            net.eval()
-            with torch.no_grad():
-                log_lam = net(X_t)
-                lam = torch.exp(log_lam).clamp(min=1e-12)
-                val_loss = -(lab_t * (log_lam - lam * ev_t) + (1 - lab_t) * (-lam * ev_t)).mean().item()
-
-            if val_loss + 1e-5 < best_loss:
-                best_loss = val_loss
-                best_state = {k: v.clone() for k, v in net.state_dict().items()}
-                stalled = 0
-            else:
-                stalled += 1
-                if stalled >= self.patience:
-                    break
-
-        if best_state is not None:
-            net.load_state_dict(best_state)
-        self.net_ = net
+        self.scale_model_ = XGBRegressor(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            learning_rate=self.learning_rate,
+            subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            random_state=self.random_state,
+            device=device,
+            n_jobs=-1,
+            verbosity=0,
+        )
+        self.scale_model_.fit(X, y)
         return self
-
-    def predict_lambda(self, rows: pd.DataFrame) -> np.ndarray:
-        import torch
-
-        if self.net_ is None:
-            raise RuntimeError("Call fit() before predicting neural rates.")
-        x = rows.copy()
-        if "prefix_actions" in x.columns:
-            x = x.drop(columns=["prefix_actions"])
-        for col in self.feature_columns_:
-            if col not in x.columns:
-                x[col] = 0
-        X = self.scaler_.transform(
-            self.imputer_.transform(x[self.feature_columns_])
-        ).astype("float32")
-        self.net_.eval()
-        with torch.no_grad():
-            log_lam = self.net_(torch.from_numpy(X)).numpy().ravel()
-        return np.clip(np.exp(log_lam), 1e-12, None)
 
     def predict_success_probability(
         self,
-        rows: pd.DataFrame,
-        horizon_seconds: float | None = None,
+        features: pd.DataFrame,
+        success_state: int = 28,
+        horizon_seconds: float = 60 * 24 * 60 * 60,
     ) -> np.ndarray:
-        horizon = self.horizon_seconds if horizon_seconds is None else horizon_seconds
-        lambdas = self.predict_lambda(rows)
-        return np.clip(1.0 - np.exp(-lambdas * horizon), 0.0, 1.0)
+        from scipy.linalg import expm
 
-    def predict_expected_success_time(self, rows: pd.DataFrame) -> np.ndarray:
-        return 1.0 / self.predict_lambda(rows)
+        if self.scale_model_ is None or self.global_ctmc_ is None:
+            raise RuntimeError("Call fit() before predicting.")
+        if success_state not in self.states_:
+            return np.zeros(len(features))
+
+        state_to_idx = {s: i for i, s in enumerate(self.states_)}
+        success_idx = state_to_idx[success_state]
+
+        # Align feature columns — fill missing with 0.
+        X = pd.DataFrame(index=features.index)
+        for col in self.feature_cols_:
+            X[col] = features[col] if col in features.columns else 0.0
+
+        log_alphas = self.scale_model_.predict(X)
+        alphas = np.exp(np.clip(log_alphas, -6, 6))  # cap at ≈400× speed-up/slow-down
+
+        # Base Q with success state made absorbing.
+        Q_base = self.global_ctmc_.Q_.to_numpy().copy()
+        Q_base[success_idx] = 0.0
+
+        current_states = features["current_state"].to_numpy(dtype=int)
+        probs = np.zeros(len(features))
+
+        for i, (alpha, current_state) in enumerate(zip(alphas, current_states)):
+            current_idx = state_to_idx.get(int(current_state))
+            if current_idx is None:
+                continue
+            P_t = expm(alpha * Q_base * horizon_seconds)
+            probs[i] = float(P_t[current_idx, success_idx])
+
+        return np.clip(probs, 0.0, 1.0)
+
+
+class TimeStratifiedCTMC:
+    """
+    Non-homogeneous CTMC: one Q matrix per journey-age window.
+
+    Each transition is placed into a time window based on cumulative elapsed
+    time within its journey. Prediction selects the Q matrix matching the test
+    journey's current age, then computes absorption probability over the full
+    remaining horizon.
+
+    Default windows (edges at 1 day and 7 days):
+        early : 0 – 1 day
+        mid   : 1 – 7 days
+        late  : 7+ days
+
+    If a bin has fewer than min_bin_transitions transitions it falls back to the
+    global (all-data) Q so sparse late-journey data never causes a degenerate matrix.
+    """
+
+    def __init__(
+        self,
+        bin_edges_seconds: tuple[float, ...] = (86_400.0, 604_800.0),
+        min_bin_transitions: int = 200,
+    ) -> None:
+        self.bin_edges_seconds = tuple(sorted(bin_edges_seconds))
+        self.min_bin_transitions = min_bin_transitions
+        self.feature_builder = JourneyFeatureBuilder()
+        self.models_: dict[int, GlobalCTMC] = {}
+        self.global_fallback_: GlobalCTMC | None = None
+        self.n_bins_: int = len(self.bin_edges_seconds) + 1
+
+    def _to_bin(self, seconds: np.ndarray | pd.Series) -> np.ndarray:
+        return np.digitize(np.asarray(seconds, dtype=float), self.bin_edges_seconds, right=False)
+
+    def fit(self, transitions: pd.DataFrame) -> "TimeStratifiedCTMC":
+        df = transitions[transitions["state"] != transitions["next_state"]].copy()
+        df = df.sort_values("id")
+        df["_cumtime"] = df.groupby("id", sort=False)["dt_seconds"].cumsum()
+        df["_bin"] = self._to_bin(df["_cumtime"].to_numpy())
+
+        self.global_fallback_ = GlobalCTMC().fit(
+            df.drop(columns=["_cumtime", "_bin"])
+        )
+        self.n_bins_ = len(self.bin_edges_seconds) + 1
+
+        for b in range(self.n_bins_):
+            bin_data = df[df["_bin"] == b].drop(columns=["_cumtime", "_bin"])
+            if len(bin_data) >= self.min_bin_transitions:
+                self.models_[b] = GlobalCTMC().fit(bin_data)
+            else:
+                self.models_[b] = self.global_fallback_
+
+        return self
+
+    def predict_success_probability(
+        self,
+        features: pd.DataFrame,
+        success_state: int = 28,
+        horizon_seconds: float = 60 * 24 * 60 * 60,
+    ) -> np.ndarray:
+        """
+        features must include 'current_state' and 'total_observed_time'.
+        total_observed_time selects which Q matrix to use per journey.
+        """
+        if not self.models_:
+            raise RuntimeError("Call fit() before predicting.")
+
+        total_times = features["total_observed_time"].to_numpy(dtype=float)
+        current_states = features["current_state"].to_numpy(dtype=int)
+        bin_idx = self._to_bin(total_times)
+
+        probs = np.zeros(len(features))
+        for b in sorted(set(bin_idx)):
+            mask = bin_idx == b
+            model = self.models_.get(int(b), self.global_fallback_)
+            probs[mask] = model.absorption_probability(
+                current_states[mask],
+                success_state=success_state,
+                horizon_seconds=horizon_seconds,
+            )
+
+        return np.clip(probs, 0.0, 1.0)
+
+    def bin_summary(self) -> pd.DataFrame:
+        edges = list(self.bin_edges_seconds)
+        rows = []
+        for b in range(self.n_bins_):
+            if b == 0:
+                label = f"0 – {edges[0] / 3600:.1f}h"
+            elif b < len(edges):
+                label = f"{edges[b-1] / 3600:.1f}h – {edges[b] / 86400:.1f}d"
+            else:
+                label = f"{edges[-1] / 86400:.1f}d +"
+            model = self.models_.get(b, self.global_fallback_)
+            n_tr = (
+                int(model.transition_counts_.to_numpy().sum())
+                if model is not None and model.transition_counts_ is not None
+                else 0
+            )
+            rows.append({
+                "bin": b,
+                "window": label,
+                "n_transitions": n_tr,
+                "n_states": len(model.states_) if model else 0,
+            })
+        return pd.DataFrame(rows)
 
 
 class ModelComparison:

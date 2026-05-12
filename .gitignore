@@ -7,14 +7,28 @@ __pycache__/
 .DS_Store
 *.pyc
 
+# Claude Code local memory
+.claude/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+
 # Local data and generated artifacts are intentionally not versioned.
+# data/* ignores direct children; each subdir also ignores its contents explicitly
+# so that files added inside data/raw/, data/cleaned/, etc. are never pushed.
 data/*
 !data/.gitkeep
 !data/raw/
+data/raw/*
 !data/raw/.gitkeep
 !data/cleaned/
+data/cleaned/*
 !data/cleaned/.gitkeep
 !data/feature_engineered/
+data/feature_engineered/*
 !data/feature_engineered/.gitkeep
 results/*
 !results/.gitkeep

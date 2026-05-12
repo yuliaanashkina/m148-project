@@ -145,6 +145,45 @@ def plot_calibration(y_true, y_prob, output_path: Path, n_bins: int = 10, title:
     return df
 
 
+def plot_predictions_by_state(
+    models: dict,
+    output_path: Path,
+    success_state: int = 28,
+    horizon_days: float = 60,
+) -> pd.DataFrame:
+    """Grouped bar chart of absorption probability per current state for multiple CTMC models."""
+    horizon_seconds = horizon_days * 24 * 60 * 60
+
+    all_states = sorted(
+        set().union(*[set(m.states_) for m in models.values()])
+    )
+    all_states = [s for s in all_states if s != success_state]
+
+    rows = []
+    for name, model in models.items():
+        probs = model.absorption_probability(
+            all_states, success_state=success_state, horizon_seconds=horizon_seconds
+        )
+        for state, prob in zip(all_states, probs):
+            rows.append({"state": state, "model": name, "success_probability": prob})
+
+    df = pd.DataFrame(rows)
+    pivot = df.pivot(index="state", columns="model", values="success_probability").fillna(0)
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    pivot.plot.bar(ax=ax, width=0.75)
+    ax.set_title(f"P(order_shipped within {horizon_days:g} days) by current state — model comparison")
+    ax.set_xlabel("current state")
+    ax.set_ylabel("success probability")
+    ax.set_ylim(0, 1)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return df
+
+
 def plot_metric_comparison(comparison: pd.DataFrame, output_path: Path) -> None:
     cols = [c for c in ["roc_auc", "average_precision", "log_loss", "brier_score"] if c in comparison.columns]
     fig, axes = plt.subplots(1, len(cols), figsize=(4 * len(cols), 4))

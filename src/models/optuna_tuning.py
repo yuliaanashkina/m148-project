@@ -2,11 +2,10 @@
 Optuna tuning for capstone prediction models.
 
 Design choices:
-- Optimize against validation log loss because Kaggle submissions are
-  probabilities.
-- Use one stratified split for comparable trials.
-- Tune the neural CTMC rate model with PyTorch + Adam/AdamW/RMSprop.
+- Optimize against mean CV log loss because Kaggle submissions are probabilities.
+- Use StratifiedKFold CV so every trial sees the same variance from all folds.
 - Tune XGBoost, histogram gradient boosting, and random forest.
+- For CTMC clustering, use KFold over journey IDs with features precomputed once.
 - Write all trial summaries and best parameters under results/.
 """
 
@@ -19,7 +18,6 @@ from pathlib import Path
 import numpy as np
 import optuna
 import pandas as pd
-import polars as pl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,24 +36,6 @@ def load_features(max_rows: int | None = 100_000) -> pd.DataFrame:
     return df.drop(columns=["prefix_actions"], errors="ignore")
 
 
-def split_xy(df: pd.DataFrame, random_state: int = 42):
-    from sklearn.model_selection import train_test_split
-
-    y = df["label"].astype(int)
-    x = df.drop(
-        columns=["id", "label", "final_outcome", "remaining_time_to_success_seconds"],
-        errors="ignore",
-    )
-    x_train, x_valid, y_train, y_valid = train_test_split(
-        x,
-        y,
-        test_size=0.25,
-        random_state=random_state,
-        stratify=y,
-    )
-    return x_train, x_valid, y_train, y_valid
-
-
 def score_probs(y_true, probs) -> dict[str, float]:
     from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, roc_auc_score
 
@@ -69,6 +49,7 @@ def score_probs(y_true, probs) -> dict[str, float]:
 
 
 def preprocess_arrays(x_train: pd.DataFrame, x_valid: pd.DataFrame):
+    """Impute + scale; used by tune_neural_rate."""
     from sklearn.impute import SimpleImputer
     from sklearn.preprocessing import StandardScaler
 
@@ -79,12 +60,24 @@ def preprocess_arrays(x_train: pd.DataFrame, x_valid: pd.DataFrame):
     return x_train_np.astype("float32"), x_valid_np.astype("float32")
 
 
-def tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials: int, random_state: int, device: str = "cpu"):
-    import xgboost as xgb
+# ---------------------------------------------------------------------------
+# Tabular tuners — each takes raw (X_raw, y) and runs StratifiedKFold inside
+# ---------------------------------------------------------------------------
 
-    # Build DMatrix once so GPU memory is allocated once across all trials.
-    dtrain = xgb.DMatrix(x_train, label=y_train.to_numpy())
-    dvalid = xgb.DMatrix(x_valid, label=y_valid.to_numpy())
+def tune_xgboost(
+    X_raw: pd.DataFrame,
+    y: pd.Series,
+    n_trials: int,
+    random_state: int,
+    n_folds: int = 5,
+    device: str = "cpu",
+) -> optuna.Study:
+    import xgboost as xgb
+    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import StratifiedKFold
+
+    X_np = X_raw.to_numpy(dtype="float64")
+    y_np = y.to_numpy(dtype=int)
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -92,46 +85,66 @@ def tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials: int, random_state
             "eval_metric": "logloss",
             "device": device,
             "seed": random_state,
-            # tree structure
             "max_depth": trial.suggest_int("max_depth", 3, 10),
             "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 64.0, log=True),
             "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
             "max_delta_step": trial.suggest_float("max_delta_step", 0.0, 10.0),
-            # step size / regularisation
             "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 20.0, log=True),
-            # sampling
             "subsample": trial.suggest_float("subsample", 0.5, 1.0),
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
             "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.4, 1.0),
             "colsample_bynode": trial.suggest_float("colsample_bynode", 0.4, 1.0),
         }
 
-        booster = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=3000,
-            evals=[(dvalid, "valid")],
-            early_stopping_rounds=50,
-            verbose_eval=False,
-        )
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        fold_losses = []
 
-        best_iter = int(booster.best_iteration)
-        probs = booster.predict(dvalid, iteration_range=(0, best_iter + 1))
-        metrics = score_probs(y_valid, probs)
-        trial.set_user_attr("metrics", metrics)
-        trial.set_user_attr("best_iteration", best_iter)
-        return metrics["log_loss"]
+        for tr_idx, val_idx in cv.split(X_np, y_np):
+            imputer = SimpleImputer(strategy="median")
+            X_tr = imputer.fit_transform(X_np[tr_idx]).astype("float32")
+            X_val = imputer.transform(X_np[val_idx]).astype("float32")
+
+            dtrain = xgb.DMatrix(X_tr, label=y_np[tr_idx])
+            dvalid = xgb.DMatrix(X_val, label=y_np[val_idx])
+
+            booster = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=3000,
+                evals=[(dvalid, "valid")],
+                early_stopping_rounds=50,
+                verbose_eval=False,
+            )
+            best_iter = int(booster.best_iteration)
+            probs = booster.predict(dvalid, iteration_range=(0, best_iter + 1))
+            fold_losses.append(score_probs(y_np[val_idx], probs)["log_loss"])
+
+        mean_loss = float(np.mean(fold_losses))
+        trial.set_user_attr("fold_losses", fold_losses)
+        trial.set_user_attr("metrics", {"log_loss": mean_loss})
+        return mean_loss
 
     return run_study("xgboost", objective, n_trials)
 
 
-def tune_hist_gradient_boosting(x_train, x_valid, y_train, y_valid, n_trials: int, random_state: int):
+def tune_hist_gradient_boosting(
+    X_raw: pd.DataFrame,
+    y: pd.Series,
+    n_trials: int,
+    random_state: int,
+    n_folds: int = 5,
+) -> optuna.Study:
     from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import StratifiedKFold
+
+    X_np = X_raw.to_numpy(dtype="float64")
+    y_np = y.to_numpy(dtype=int)
 
     def objective(trial: optuna.Trial) -> float:
-        model = HistGradientBoostingClassifier(
+        hgb_params = dict(
             learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
             max_iter=trial.suggest_int("max_iter", 100, 600),
             max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 15, 63),
@@ -139,19 +152,44 @@ def tune_hist_gradient_boosting(x_train, x_valid, y_train, y_valid, n_trials: in
             l2_regularization=trial.suggest_float("l2_regularization", 1e-8, 10.0, log=True),
             random_state=random_state,
         )
-        model.fit(x_train, y_train)
-        probs = model.predict_proba(x_valid)[:, 1]
-        trial.set_user_attr("metrics", score_probs(y_valid, probs))
-        return score_probs(y_valid, probs)["log_loss"]
+
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        fold_losses = []
+
+        for tr_idx, val_idx in cv.split(X_np, y_np):
+            imputer = SimpleImputer(strategy="median")
+            X_tr = imputer.fit_transform(X_np[tr_idx])
+            X_val = imputer.transform(X_np[val_idx])
+
+            model = HistGradientBoostingClassifier(**hgb_params)
+            model.fit(X_tr, y_np[tr_idx])
+            probs = model.predict_proba(X_val)[:, 1]
+            fold_losses.append(score_probs(y_np[val_idx], probs)["log_loss"])
+
+        mean_loss = float(np.mean(fold_losses))
+        trial.set_user_attr("fold_losses", fold_losses)
+        trial.set_user_attr("metrics", {"log_loss": mean_loss})
+        return mean_loss
 
     return run_study("hist_gradient_boosting", objective, n_trials)
 
 
-def tune_random_forest(x_train, x_valid, y_train, y_valid, n_trials: int, random_state: int):
+def tune_random_forest(
+    X_raw: pd.DataFrame,
+    y: pd.Series,
+    n_trials: int,
+    random_state: int,
+    n_folds: int = 5,
+) -> optuna.Study:
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.model_selection import StratifiedKFold
+
+    X_np = X_raw.to_numpy(dtype="float64")
+    y_np = y.to_numpy(dtype=int)
 
     def objective(trial: optuna.Trial) -> float:
-        model = RandomForestClassifier(
+        rf_params = dict(
             n_estimators=trial.suggest_int("n_estimators", 100, 500),
             max_depth=trial.suggest_int("max_depth", 4, 30),
             min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 30),
@@ -160,13 +198,31 @@ def tune_random_forest(x_train, x_valid, y_train, y_valid, n_trials: int, random
             random_state=random_state,
             n_jobs=-1,
         )
-        model.fit(x_train, y_train)
-        probs = model.predict_proba(x_valid)[:, 1]
-        trial.set_user_attr("metrics", score_probs(y_valid, probs))
-        return score_probs(y_valid, probs)["log_loss"]
+
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        fold_losses = []
+
+        for tr_idx, val_idx in cv.split(X_np, y_np):
+            imputer = SimpleImputer(strategy="median")
+            X_tr = imputer.fit_transform(X_np[tr_idx])
+            X_val = imputer.transform(X_np[val_idx])
+
+            model = RandomForestClassifier(**rf_params)
+            model.fit(X_tr, y_np[tr_idx])
+            probs = model.predict_proba(X_val)[:, 1]
+            fold_losses.append(score_probs(y_np[val_idx], probs)["log_loss"])
+
+        mean_loss = float(np.mean(fold_losses))
+        trial.set_user_attr("fold_losses", fold_losses)
+        trial.set_user_attr("metrics", {"log_loss": mean_loss})
+        return mean_loss
 
     return run_study("random_forest", objective, n_trials)
 
+
+# ---------------------------------------------------------------------------
+# Neural rate tuner (legacy — not in default model list)
+# ---------------------------------------------------------------------------
 
 def make_torch_model(input_dim: int, layers: list[int], dropout: float):
     import torch
@@ -214,8 +270,6 @@ def tune_neural_rate(x_train, x_valid, y_train, y_valid, n_trials: int, random_s
         else:
             optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        # Binary event probability at 60 days. This directly tunes the rate
-        # network for the downstream Kaggle probability loss.
         loss_fn = nn.BCEWithLogitsLoss()
         ds = TensorDataset(torch.from_numpy(x_train_np), torch.from_numpy(y_train_np[:, None]))
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
@@ -223,6 +277,7 @@ def tune_neural_rate(x_train, x_valid, y_train, y_valid, n_trials: int, random_s
         best_loss = np.inf
         patience = 5
         stalled = 0
+        probs = np.zeros(len(y_valid_np))
         for _ in range(epochs):
             model.train()
             for xb, yb in loader:
@@ -250,6 +305,206 @@ def tune_neural_rate(x_train, x_valid, y_train, y_valid, n_trials: int, random_s
 
     return run_study("neural_rate_torch", objective, n_trials)
 
+
+# ---------------------------------------------------------------------------
+# CTMC clustering k-tuner — features precomputed once, KFold over journey IDs
+# ---------------------------------------------------------------------------
+
+def tune_ctmc_clustering(
+    max_journeys: int = 100_000,
+    n_trials: int = 20,
+    k_min: int = 2,
+    k_max: int = 12,
+    random_state: int = 42,
+    n_folds: int = 5,
+) -> optuna.Study:
+    """Optimize n_clusters for ClusteredCTMC against mean CV brier score.
+
+    Journey features are computed once before the Optuna loop; each trial only
+    does KMeans + k GlobalCTMC fits per fold, keeping per-trial time low.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import brier_score_loss
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    try:
+        from .ctmc import CTMCData, JourneyFeatureBuilder, GlobalCTMC
+    except ImportError:
+        from ctmc import CTMCData, JourneyFeatureBuilder, GlobalCTMC
+
+    data = CTMCData()
+    print("  Loading transitions...")
+    transitions = data.transition_table(max_journeys=max_journeys)
+    labels = data.load_binary_labels().set_index("id")["label"]
+
+    # Precompute features once on all journeys — fit_transform on full set keeps
+    # top_actions_ stable; cross-contamination is negligible for aggregate stats.
+    print("  Building journey features (runs once)...")
+    builder = JourneyFeatureBuilder()
+    feats_all = builder.fit_transform(transitions)
+
+    # Identify clustering columns (mirrors ClusteredCTMC logic).
+    prop_cols  = [c for c in feats_all.columns if c.startswith("action_prop_")]
+    state_cols = [c for c in ["first_state", "current_state"] if c in feats_all.columns]
+    cluster_cols = prop_cols + state_cols
+
+    # Journey IDs and their binary labels for stratified splitting.
+    all_ids = feats_all["id"].to_numpy()
+    all_id_labels = labels.reindex(all_ids).fillna(0).to_numpy(dtype=int)
+
+    # Index feats_all by id for fast fold selection.
+    feats_indexed = feats_all.set_index("id")
+
+    def objective(trial: optuna.Trial) -> float:
+        k = trial.suggest_int("n_clusters", k_min, k_max)
+
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        fold_scores = []
+
+        for tr_idx, val_idx in cv.split(all_ids, all_id_labels):
+            train_ids = all_ids[tr_idx]
+            val_ids   = all_ids[val_idx]
+
+            train_ids_set = set(train_ids.tolist())
+            val_ids_set   = set(val_ids.tolist())
+
+            trans_train = transitions[transitions["id"].isin(train_ids_set)]
+            feats_train = feats_indexed.loc[feats_indexed.index.isin(train_ids_set)].reset_index()
+            feats_val   = feats_indexed.loc[feats_indexed.index.isin(val_ids_set)].reset_index()
+
+            x_train = feats_train.drop(columns=["id"])
+            x_val   = feats_val.drop(columns=["id"])
+
+            pipeline = Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler",  StandardScaler()),
+                ("cluster", KMeans(n_clusters=k, random_state=random_state, n_init=10)),
+            ])
+            cluster_labels_train = pipeline.fit_predict(x_train[cluster_cols])
+
+            # Fit one GlobalCTMC per cluster.
+            assignments = feats_train[["id"]].copy()
+            assignments["cluster"] = cluster_labels_train
+            merged = trans_train.merge(assignments, on="id", how="inner")
+            global_fallback = GlobalCTMC().fit(trans_train)
+            cluster_models: dict[int, GlobalCTMC] = {}
+            for cid, g in merged.groupby("cluster"):
+                cluster_models[int(cid)] = GlobalCTMC().fit(g)
+
+            # Predict on val.
+            for col in cluster_cols:
+                if col not in x_val.columns:
+                    x_val[col] = 0
+            cluster_labels_val = pipeline.predict(x_val[cluster_cols])
+
+            probs = np.zeros(len(feats_val))
+            for cid in sorted(set(cluster_labels_val)):
+                mask  = cluster_labels_val == cid
+                model = cluster_models.get(int(cid), global_fallback)
+                probs[mask] = model.absorption_probability(
+                    feats_val.loc[mask, "current_state"]
+                )
+
+            val_labels = labels.reindex(feats_val["id"]).fillna(0).to_numpy()
+            fold_scores.append(float(brier_score_loss(val_labels, np.clip(probs, 0.0, 1.0))))
+
+        mean_score = float(np.mean(fold_scores))
+        trial.set_user_attr("fold_scores", fold_scores)
+        trial.set_user_attr("brier_score", mean_score)
+        print(f"    trial {trial.number:>3}  k={k}  brier={mean_score:.5f}  folds={[f'{s:.5f}' for s in fold_scores]}")
+        return mean_score
+
+    study = run_study("ctmc_clustering_k", objective, n_trials)
+    best_k = study.best_params["n_clusters"]
+    print(f"Best n_clusters: {best_k}  (brier={study.best_value:.5f})")
+    return study
+
+
+# ---------------------------------------------------------------------------
+# Time-stratified CTMC bin-edge tuner
+# ---------------------------------------------------------------------------
+
+def tune_time_stratified_ctmc(
+    max_journeys: int = 100_000,
+    n_trials: int = 20,
+    random_state: int = 42,
+    n_folds: int = 5,
+) -> optuna.Study:
+    """Optimize bin-edge boundaries for TimeStratifiedCTMC via CV brier score.
+
+    Parameterization: edge1_hours (log-scale) and delta_hours (log-scale), so
+    edge2 = edge1 + delta. This guarantees edge2 > edge1 without constraints.
+    Features are precomputed once; fitting is cheap (3 GlobalCTMC fits per fold).
+    """
+    from sklearn.metrics import brier_score_loss
+    from sklearn.model_selection import StratifiedKFold
+
+    try:
+        from .ctmc import CTMCData, JourneyFeatureBuilder, TimeStratifiedCTMC
+    except ImportError:
+        from ctmc import CTMCData, JourneyFeatureBuilder, TimeStratifiedCTMC
+
+    data = CTMCData()
+    print("  Loading transitions...")
+    transitions = data.transition_table(max_journeys=max_journeys)
+    labels = data.load_binary_labels().set_index("id")["label"]
+
+    print("  Building journey features (runs once)...")
+    builder = JourneyFeatureBuilder()
+    feats_all = builder.fit_transform(transitions)
+
+    all_ids = feats_all["id"].to_numpy()
+    all_id_labels = labels.reindex(all_ids).fillna(0).to_numpy(dtype=int)
+    feats_indexed = feats_all.set_index("id")
+
+    def objective(trial: optuna.Trial) -> float:
+        edge1_hours = trial.suggest_float("edge1_hours", 1.0, 72.0, log=True)
+        delta_hours = trial.suggest_float("delta_hours", 12.0, 720.0, log=True)
+        edge2_hours = edge1_hours + delta_hours
+        bins = (edge1_hours * 3600.0, edge2_hours * 3600.0)
+
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        fold_scores = []
+
+        for tr_idx, val_idx in cv.split(all_ids, all_id_labels):
+            train_ids = set(all_ids[tr_idx].tolist())
+            val_ids   = set(all_ids[val_idx].tolist())
+
+            trans_train = transitions[transitions["id"].isin(train_ids)]
+            feats_val   = feats_indexed.loc[feats_indexed.index.isin(val_ids)].reset_index()
+
+            model = TimeStratifiedCTMC(bin_edges_seconds=bins)
+            model.fit(trans_train)
+
+            probs = model.predict_success_probability(feats_val)
+            val_labels = labels.reindex(feats_val["id"]).fillna(0).to_numpy()
+            fold_scores.append(float(brier_score_loss(val_labels, np.clip(probs, 0.0, 1.0))))
+
+        mean_score = float(np.mean(fold_scores))
+        trial.set_user_attr("fold_scores", fold_scores)
+        trial.set_user_attr("brier_score", mean_score)
+        trial.set_user_attr("edge2_hours", round(edge2_hours, 2))
+        print(
+            f"    trial {trial.number:>3}  "
+            f"edges=[{edge1_hours:.1f}h, {edge2_hours:.1f}h]  "
+            f"brier={mean_score:.5f}"
+        )
+        return mean_score
+
+    study = run_study("time_stratified_ctmc", objective, n_trials)
+    best = study.best_trial
+    e1 = best.params["edge1_hours"]
+    e2 = e1 + best.params["delta_hours"]
+    print(f"Best edges: [{e1:.1f}h, {e2/24:.2f}d]  (brier={study.best_value:.5f})")
+    return study
+
+
+# ---------------------------------------------------------------------------
+# Study helpers
+# ---------------------------------------------------------------------------
 
 def run_study(name: str, objective, n_trials: int) -> optuna.Study:
     sampler = optuna.samplers.TPESampler(seed=42)
@@ -284,43 +539,70 @@ def save_trials(study: optuna.Study) -> None:
     pd.DataFrame(rows).to_csv(RESULTS_DIR / f"optuna_{study.study_name}_trials.csv", index=False)
 
 
-def run_tuning(max_rows: int, n_trials: int, models: list[str], random_state: int = 42, device: str = "cpu") -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Top-level runner
+# ---------------------------------------------------------------------------
+
+def run_tuning(
+    max_rows: int,
+    n_trials: int,
+    models: list[str],
+    random_state: int = 42,
+    device: str = "cpu",
+    n_folds: int = 5,
+) -> pd.DataFrame:
     RESULTS_DIR.mkdir(exist_ok=True)
-    df = load_features(max_rows=max_rows)
-    x_train, x_valid, y_train, y_valid = split_xy(df, random_state=random_state)
+
+    tabular_needed = any(m in models for m in ("xgboost", "hgb", "hist_gradient_boosting", "rf", "random_forest"))
+    if tabular_needed:
+        df = load_features(max_rows=max_rows)
+        y = df["label"].astype(int)
+        X_raw = df.drop(
+            columns=["id", "label", "final_outcome", "remaining_time_to_success_seconds"],
+            errors="ignore",
+        )
 
     studies = []
     if "xgboost" in models:
-        studies.append(tune_xgboost(x_train, x_valid, y_train, y_valid, n_trials, random_state, device=device))
+        studies.append(tune_xgboost(X_raw, y, n_trials, random_state, n_folds=n_folds, device=device))
     if "hgb" in models or "hist_gradient_boosting" in models:
-        studies.append(tune_hist_gradient_boosting(x_train, x_valid, y_train, y_valid, n_trials, random_state))
+        studies.append(tune_hist_gradient_boosting(X_raw, y, n_trials, random_state, n_folds=n_folds))
     if "rf" in models or "random_forest" in models:
-        studies.append(tune_random_forest(x_train, x_valid, y_train, y_valid, n_trials, random_state))
-    if "neural" in models or "neural_rate" in models:
-        studies.append(tune_neural_rate(x_train, x_valid, y_train, y_valid, n_trials, random_state))
+        studies.append(tune_random_forest(X_raw, y, n_trials, random_state, n_folds=n_folds))
+    if "ctmc_k" in models:
+        studies.append(tune_ctmc_clustering(
+            max_journeys=max_rows, n_trials=n_trials, random_state=random_state, n_folds=n_folds,
+        ))
+    if "time_stratified" in models:
+        studies.append(tune_time_stratified_ctmc(
+            max_journeys=max_rows, n_trials=n_trials, random_state=random_state, n_folds=n_folds,
+        ))
 
     for study in studies:
         save_trials(study)
 
-    summary = pd.DataFrame([study_to_row(study) for study in studies]).sort_values("log_loss")
+    summary = pd.DataFrame([study_to_row(study) for study in studies])
+    if not summary.empty and "log_loss" in summary.columns:
+        summary = summary.sort_values("log_loss")
     summary.to_csv(RESULTS_DIR / "optuna_tuning_summary.csv", index=False)
     return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tune project models with Optuna.")
-    parser.add_argument("--max-rows", type=int, default=100_000)
-    parser.add_argument("--n-trials", type=int, default=20)
+    parser.add_argument("--max-rows",  type=int, default=100_000)
+    parser.add_argument("--n-trials",  type=int, default=20)
+    parser.add_argument("--n-folds",   type=int, default=5, help="StratifiedKFold splits per trial")
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["xgboost", "hgb", "rf", "neural"],
-        help="Any of: xgboost hgb rf neural",
+        default=["xgboost", "hgb", "rf"],
+        help="Any of: xgboost hgb rf ctmc_k time_stratified",
     )
     parser.add_argument(
         "--device",
         default="cpu",
-        help="XGBoost device: 'cpu' or 'cuda' (requires CUDA build of xgboost)",
+        help="XGBoost device: 'cpu' or 'cuda'",
     )
     args = parser.parse_args()
 
@@ -329,6 +611,7 @@ def main() -> None:
         n_trials=args.n_trials,
         models=args.models,
         device=args.device,
+        n_folds=args.n_folds,
     )
     print(summary)
 
