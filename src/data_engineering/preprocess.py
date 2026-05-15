@@ -22,12 +22,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import polars as pl
 
 SUCCESS_ED_ID: int = 28
 HORIZON_DAYS: int = 60
 TOP_N_ACTIONS: int = 20
+TOP_N_EVENTS: int = 50
 MAX_SAMPLES_PER_JOURNEY: int = 60
+SUCCESS_EVENT: str = "order_shipped"
 
 MILESTONE_ACTIONS: dict[str, int] = {
     "has_add_to_cart":        11,
@@ -66,8 +69,9 @@ def parse_timestamps(q: pl.LazyFrame) -> pl.LazyFrame:
 def flatten_journeys(q: pl.LazyFrame) -> pl.DataFrame:
     """Aggregate events into one row per journey.
 
-    Each journey struct contains {event_timestamp, ed_id} so that
-    CTMCData.events() can unnest them directly.
+    Each journey struct contains {event_timestamp, event_name, ed_id} so that
+    CTMCData.events() can unnest it directly while newer feature builders can
+    use event names.
 
     Returns columns: id, journey, num_actions, num_unique_actions,
     start_time, end_time, duration_seconds, first_action, last_action,
@@ -77,7 +81,7 @@ def flatten_journeys(q: pl.LazyFrame) -> pl.DataFrame:
         q.sort(["id", "event_timestamp", "ed_id"])
         .group_by("id")
         .agg([
-            pl.struct(["event_timestamp", "ed_id"]).alias("journey"),
+            pl.struct(["event_timestamp", "event_name", "ed_id"]).alias("journey"),
             pl.len().alias("num_actions"),
             pl.col("ed_id").n_unique().alias("num_unique_actions"),
             pl.col("event_timestamp").min().alias("start_time"),
@@ -341,6 +345,325 @@ def add_derived_features(
     )
 
     return training_df
+
+
+# ---------------------------------------------------------------------------
+# Step 7b — Realistic time truncation + event-name features
+# ---------------------------------------------------------------------------
+
+def clean_col_name(x) -> str:
+    return (
+        str(x)
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace("/", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
+def realistic_top_events(
+    labeled: pl.DataFrame,
+    *,
+    top_n_events: int = TOP_N_EVENTS,
+    success_event: str = SUCCESS_EVENT,
+) -> list[str]:
+    """Return the top event names used for realistic truncation count columns."""
+    model_base = labeled.filter(
+        pl.col("journey_status").is_in(["successful", "incomplete"])
+    )
+    if model_base.is_empty():
+        return []
+
+    events = (
+        model_base
+        .explode("journey")
+        .unnest("journey")
+    )
+    event_col = "event_name" if "event_name" in events.columns else "ed_id"
+    success_values = [success_event]
+    if event_col == "ed_id":
+        success_values.append(str(SUCCESS_ED_ID))
+
+    top = (
+        events
+        .with_columns(pl.col(event_col).cast(pl.Utf8).alias("_event_name_for_counts"))
+        .filter(pl.col("_event_name_for_counts").is_not_null())
+        .filter(~pl.col("_event_name_for_counts").is_in(success_values))
+        .group_by("_event_name_for_counts")
+        .len()
+        .sort("len", descending=True)
+        .head(top_n_events)
+        .get_column("_event_name_for_counts")
+        .to_list()
+    )
+    return [str(x) for x in top]
+
+
+def add_realistic_truncation_features(
+    labeled: pl.DataFrame,
+    *,
+    seed: int = 42,
+    max_samples_per_journey: int = MAX_SAMPLES_PER_JOURNEY,
+    top_n_events: int = TOP_N_EVENTS,
+    top_events: Sequence[str] | None = None,
+    success_event: str = SUCCESS_EVENT,
+) -> pl.DataFrame:
+    """Build multi-snapshot prefix features from the pulled notebook.
+
+    Successful journeys are truncated no later than 70% of the time to
+    completion to reduce success leakage. Incomplete journeys are sampled over
+    their observed active window. The output is one row per snapshot and keeps
+    `snapshot_time`, `last_ed_id`, and rich prefix features for CTMC clustering.
+    """
+    rng = random.Random(seed)
+    model_base = labeled.filter(
+        pl.col("journey_status").is_in(["successful", "incomplete"])
+    )
+
+    if top_events is None:
+        top_events = realistic_top_events(
+            model_base,
+            top_n_events=top_n_events,
+            success_event=success_event,
+        )
+    else:
+        top_events = [str(x) for x in top_events]
+
+    rows: list[dict] = []
+    for row in model_base.iter_rows(named=True):
+        journey = row["journey"]
+        if not journey:
+            continue
+
+        start_time = row["start_time"]
+        end_time = row["end_time"]
+        if start_time is None or end_time is None:
+            continue
+
+        status = row["journey_status"]
+        label = 1 if status == "successful" else 0
+
+        event_times = [e["event_timestamp"] for e in journey]
+        event_ts = [t.timestamp() for t in event_times]
+        event_ids = [int(e["ed_id"]) for e in journey]
+        event_names = [str(e.get("event_name", e["ed_id"])) for e in journey]
+
+        completion_times = [
+            t for t, name in zip(event_times, event_names)
+            if name == success_event
+        ]
+        effective_end = completion_times[0] if completion_times else end_time
+
+        start_ts = start_time.timestamp()
+        end_ts = effective_end.timestamp()
+        if end_ts <= start_ts:
+            continue
+
+        duration_days = (end_ts - start_ts) / 86400
+        n_samples = min(max(1, math.ceil(duration_days)), max_samples_per_journey)
+
+        for sample_num in range(1, n_samples + 1):
+            if status == "successful":
+                max_allowed_ts = start_ts + 0.70 * (end_ts - start_ts)
+                cutoff_ts = rng.uniform(start_ts, max_allowed_ts)
+            else:
+                cutoff_ts = rng.uniform(start_ts, end_ts)
+
+            keep_idx = sum(1 for t in event_ts if t <= cutoff_ts)
+            if keep_idx == 0:
+                continue
+
+            prefix_times = event_times[:keep_idx]
+            prefix_ids = event_ids[:keep_idx]
+            prefix_names = event_names[:keep_idx]
+
+            non_leak = [
+                i for i, name in enumerate(prefix_names)
+                if name != success_event
+            ]
+            if not non_leak:
+                continue
+
+            prefix_times = [prefix_times[i] for i in non_leak]
+            prefix_ids = [prefix_ids[i] for i in non_leak]
+            prefix_names = [prefix_names[i] for i in non_leak]
+
+            first_time = prefix_times[0]
+            last_time = prefix_times[-1]
+            snapshot_time = last_time
+            snapshot_age_days = (snapshot_time - start_time).total_seconds() / 86400
+            active_span_days = (last_time - first_time).total_seconds() / 86400
+
+            gaps = [
+                (prefix_times[i] - prefix_times[i - 1]).total_seconds() / 86400
+                for i in range(1, len(prefix_times))
+            ]
+            counts = Counter(prefix_names)
+
+            out = {
+                "id": row["id"],
+                "sample_num": sample_num,
+                "snapshot_id": f"{row['id']}::{sample_num}",
+                "journey_status": status,
+                "source_table": "complete" if status == "successful" else "incomplete",
+                "label": label,
+                "snapshot_time": snapshot_time,
+                "snapshot_age_days": snapshot_age_days,
+                "num_events": len(prefix_names),
+                "num_unique_event_names": len(set(prefix_names)),
+                "num_unique_ed_ids": len(set(prefix_ids)),
+                "first_event_time": first_time,
+                "last_event_time": last_time,
+                "first_event_name": prefix_names[0],
+                "last_event_name": prefix_names[-1],
+                "first_ed_id": prefix_ids[0],
+                "last_ed_id": prefix_ids[-1],
+                "current_state": prefix_ids[-1],
+                "active_span_days": active_span_days,
+                "days_since_last_event": 0.0,
+                "events_per_day_since_start": len(prefix_names) / (snapshot_age_days + 1),
+                "events_per_active_day": len(prefix_names) / (active_span_days + 1),
+                "avg_gap_days": float(np.mean(gaps)) if gaps else 0.0,
+                "max_gap_days": float(np.max(gaps)) if gaps else 0.0,
+                "std_gap_days": float(np.std(gaps)) if gaps else 0.0,
+                "last1_event": prefix_names[-1],
+                "last2_event": prefix_names[-2] if len(prefix_names) >= 2 else "missing",
+                "last3_event": prefix_names[-3] if len(prefix_names) >= 3 else "missing",
+                "last4_event": prefix_names[-4] if len(prefix_names) >= 4 else "missing",
+                "last5_event": prefix_names[-5] if len(prefix_names) >= 5 else "missing",
+                "prefix_actions": prefix_ids,
+            }
+
+            for window in [1, 3, 7, 14, 30]:
+                out[f"events_last_{window}d"] = sum(
+                    (snapshot_time - t).total_seconds() / 86400 <= window
+                    for t in prefix_times
+                )
+
+            out["recent_1d_to_30d"] = out["events_last_1d"] / (out["events_last_30d"] + 1)
+            out["recent_3d_to_30d"] = out["events_last_3d"] / (out["events_last_30d"] + 1)
+            out["recent_7d_to_30d"] = out["events_last_7d"] / (out["events_last_30d"] + 1)
+
+            for event in top_events:
+                out[f"cnt_{clean_col_name(event)}"] = counts.get(event, 0)
+
+            rows.append(out)
+
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows).fill_null(0)
+
+
+def build_open_journey_realistic_features(
+    events: pl.DataFrame,
+    *,
+    success_event: str = SUCCESS_EVENT,
+) -> pl.DataFrame:
+    """Build one realistic feature row per open/test journey.
+
+    Open journeys are already observed prefixes, so this does not sample or
+    truncate. It mirrors add_realistic_truncation_features on the full observed
+    prefix and omits training-only label/suffix fields.
+    """
+    if events.is_empty():
+        return pl.DataFrame()
+
+    required = {"id", "event_timestamp", "event_name", "ed_id"}
+    missing = required - set(events.columns)
+    if missing:
+        raise ValueError(f"Open journey events missing required columns: {sorted(missing)}")
+
+    events = (
+        events
+        .with_columns([
+            pl.col("event_timestamp").str.to_datetime(time_zone="UTC")
+            if events.schema["event_timestamp"] == pl.Utf8
+            else pl.col("event_timestamp"),
+            pl.col("event_name").cast(pl.Utf8),
+            pl.col("ed_id").cast(pl.Int64),
+        ])
+        .sort(["id", "event_timestamp", "ed_id"])
+    )
+
+    rows: list[dict] = []
+    for row in (
+        events.group_by("id")
+        .agg(pl.struct(["event_timestamp", "event_name", "ed_id"]).alias("journey"))
+        .iter_rows(named=True)
+    ):
+        journey = row["journey"]
+        if not journey:
+            continue
+
+        prefix_times = [e["event_timestamp"] for e in journey if e["event_name"] != success_event]
+        prefix_ids = [int(e["ed_id"]) for e in journey if e["event_name"] != success_event]
+        prefix_names = [str(e["event_name"]) for e in journey if e["event_name"] != success_event]
+        if not prefix_names:
+            continue
+
+        first_time = prefix_times[0]
+        last_time = prefix_times[-1]
+        snapshot_time = last_time
+        snapshot_age_days = (snapshot_time - first_time).total_seconds() / 86400
+        active_span_days = snapshot_age_days
+        gaps = [
+            (prefix_times[i] - prefix_times[i - 1]).total_seconds() / 86400
+            for i in range(1, len(prefix_times))
+        ]
+        counts = Counter(prefix_names)
+
+        out = {
+            "id": row["id"],
+            "sample_num": 1,
+            "snapshot_id": f"{row['id']}::open",
+            "journey_status": "open",
+            "source_table": "open",
+            "snapshot_time": snapshot_time,
+            "snapshot_age_days": snapshot_age_days,
+            "num_events": len(prefix_names),
+            "num_unique_event_names": len(set(prefix_names)),
+            "num_unique_ed_ids": len(set(prefix_ids)),
+            "first_event_time": first_time,
+            "last_event_time": last_time,
+            "first_event_name": prefix_names[0],
+            "last_event_name": prefix_names[-1],
+            "first_ed_id": prefix_ids[0],
+            "last_ed_id": prefix_ids[-1],
+            "current_state": prefix_ids[-1],
+            "active_span_days": active_span_days,
+            "days_since_last_event": 0.0,
+            "events_per_day_since_start": len(prefix_names) / (snapshot_age_days + 1),
+            "events_per_active_day": len(prefix_names) / (active_span_days + 1),
+            "avg_gap_days": float(np.mean(gaps)) if gaps else 0.0,
+            "max_gap_days": float(np.max(gaps)) if gaps else 0.0,
+            "std_gap_days": float(np.std(gaps)) if gaps else 0.0,
+            "last1_event": prefix_names[-1],
+            "last2_event": prefix_names[-2] if len(prefix_names) >= 2 else "missing",
+            "last3_event": prefix_names[-3] if len(prefix_names) >= 3 else "missing",
+            "last4_event": prefix_names[-4] if len(prefix_names) >= 4 else "missing",
+            "last5_event": prefix_names[-5] if len(prefix_names) >= 5 else "missing",
+            "prefix_actions": prefix_ids,
+        }
+
+        for window in [1, 3, 7, 14, 30]:
+            out[f"events_last_{window}d"] = sum(
+                (snapshot_time - t).total_seconds() / 86400 <= window
+                for t in prefix_times
+            )
+
+        out["recent_1d_to_30d"] = out["events_last_1d"] / (out["events_last_30d"] + 1)
+        out["recent_3d_to_30d"] = out["events_last_3d"] / (out["events_last_30d"] + 1)
+        out["recent_7d_to_30d"] = out["events_last_7d"] / (out["events_last_30d"] + 1)
+
+        for event, count in counts.items():
+            out[f"cnt_{clean_col_name(event)}"] = count
+
+        rows.append(out)
+
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows).fill_null(0)
 
 
 # ---------------------------------------------------------------------------

@@ -132,12 +132,19 @@ def write_submission(
 def fit_training_ctmcs(
     max_train_journeys: int | None,
     n_clusters: int,
+    use_spectral_clustering: bool = False,
 ) -> tuple[pd.DataFrame, GlobalCTMC, ClusteredCTMC, JourneyFeatureBuilder]:
     data = CTMCData()
-    transitions = data.transition_table(max_journeys=max_train_journeys)
+    transitions = data.transition_table(
+        max_journeys=max_train_journeys,
+        customer_actions_only=True,
+    )
 
     global_ctmc = GlobalCTMC().fit(transitions)
-    clustered_ctmc = ClusteredCTMC(n_clusters=n_clusters).fit(transitions)
+    clustered_ctmc = ClusteredCTMC(
+        n_clusters=n_clusters,
+        use_spectral_clustering=use_spectral_clustering,
+    ).fit(transitions)
     builder = clustered_ctmc.feature_builder
 
     return transitions, global_ctmc, clustered_ctmc, builder
@@ -149,15 +156,18 @@ def create_ctmc_submissions(
     output_dir: Path = SUBMISSION_DIR,
     max_train_journeys: int | None = 100_000,
     n_clusters: int = 3,
+    use_spectral_clustering: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    events = load_test_events(test_events_path)
+    raw_events = load_test_events(test_events_path)
+    events = raw_events[raw_events["ed_id"].isin(CTMCData().customer_action_states(include_success=True))].copy()
     if sample_path is not None and not sample_path.exists():
-        write_flattened_all0_template(events, sample_path)
+        write_flattened_all0_template(raw_events, sample_path)
         print(f"Created Kaggle ID template: {sample_path}")
 
     _, global_ctmc, clustered_ctmc, builder = fit_training_ctmcs(
         max_train_journeys=max_train_journeys,
         n_clusters=n_clusters,
+        use_spectral_clustering=use_spectral_clustering,
     )
 
     features = test_features_from_events(events, builder)
@@ -216,6 +226,11 @@ def main() -> None:
     parser.add_argument("--sample", type=Path, default=DEFAULT_SAMPLE)
     parser.add_argument("--max-train-journeys", type=int, default=100_000)
     parser.add_argument("--n-clusters", type=int, default=3)
+    parser.add_argument(
+        "--use-spectral-clustering",
+        action="store_true",
+        help="Use spectral clustering instead of KMeans inside ClusteredCTMC.",
+    )
     parser.add_argument("--output-dir", type=Path, default=SUBMISSION_DIR)
     args = parser.parse_args()
 
@@ -225,6 +240,7 @@ def main() -> None:
         output_dir=args.output_dir,
         max_train_journeys=args.max_train_journeys,
         n_clusters=args.n_clusters,
+        use_spectral_clustering=args.use_spectral_clustering,
     )
     for name, df in outputs.items():
         print(f"{name}: {df.shape}")

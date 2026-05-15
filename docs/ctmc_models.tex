@@ -1,6 +1,6 @@
 \documentclass[11pt]{article}
 
-\usepackage{amsmath, amssymb, amsthm}
+\usepackage{amsmath, amssymb}
 \usepackage{geometry}
 \usepackage{hyperref}
 \usepackage{booktabs}
@@ -25,260 +25,184 @@
 \tableofcontents
 \newpage
 
-% ============================================================
 \section{Problem Setup}
-% ============================================================
 
-Each customer journey is a sequence of discrete actions $a_1, a_2, \ldots, a_n$
-recorded at continuous timestamps. The goal is to predict, from a partially
-observed prefix, whether the journey will reach the success state
-(action \texttt{ed\_id} = 28, \emph{order\_shipped}) within a 60-day horizon.
-
-We model journeys as realizations of a \emph{Continuous-Time Markov Chain}
-(CTMC) on the action-type state space $\mathcal{S} = \{s_1, \ldots, s_K\}$.
-The key quantity is the \textbf{generator matrix} $Q \in \mathbb{R}^{K \times K}$
-with entries
+Each customer journey is a timestamped sequence of events. The project label is
+binary:
 \[
-    q_{ij} = \begin{cases}
-        \lambda_{ij} \geq 0 & i \neq j \\
-        -\sum_{j \neq i} \lambda_{ij} & i = j
+    y =
+    \begin{cases}
+    1 & \text{journey reaches \texttt{order\_shipped}, \texttt{ed\_id}=28,} \\
+    0 & \text{journey fails by taking no customer action for 60 days.}
     \end{cases}
 \]
-where $\lambda_{ij}$ is the instantaneous rate of transitioning from state $i$
-to state $j$.
 
-\subsection*{Inference target}
-
-Given current state $s$ at snapshot time, we want
+This is not exactly the same target as the original CTMC experiments. The first
+CTMC models estimated
 \[
-    P\!\left(T_{\text{success}} \leq \tau \mid X(0) = s\right)
-    = \left[e^{Q^* \tau}\right]_{s,\,s^*}
+    P(T_{\text{success}} \leq 60\text{ days} \mid X(0)=s),
 \]
-where $\tau = 60 \times 86400$ seconds, $s^* = 28$ is the absorbing success
-state, and $Q^*$ is the generator with row $s^*$ zeroed out (making success
-absorbing).
+the probability of hitting the success state within a fixed horizon. The
+classification target is better described as
+\[
+    P(T_{\text{success}} < T_{\text{inactivity-failure}} \mid X(0)=s),
+\]
+where the failure time occurs when no customer action happens for 60 days.
 
-% ============================================================
-\section{Model 1: Global CTMC}
-% ============================================================
+\section{State-Space Choice}
 
-\subsection{Overview}
+The file \texttt{data/Event Definitions.csv} mixes customer actions with
+company or system events. For the inactivity definition, company/system events
+should not reset the 60-day clock. Therefore the active CTMC state space uses
+customer-initiated actions only:
+\[
+\{2,3,4,5,6,7,8,9,10,11,18,19,22,23,25\}.
+\]
+The success event \texttt{order\_shipped} (\texttt{ed\_id}=28) is retained as a
+terminal outcome state, not as a customer action. The timeout-aware models also
+add an artificial absorbing failure state \texttt{-1}.
 
-A single generator matrix $Q$ is estimated from all training journeys pooled
-together. This is the simplest model and serves as the baseline for the others.
+This design intentionally excludes states such as approval, decline, pending,
+catalog mail, downpayment received/cleared, fraud review, account activation,
+and order fulfillment events from the behavioral CTMC state space.
+
+\section{Retained Baseline 1: Global CTMC}
 
 \subsection{Fitting}
 
-Let $\mathcal{D}$ be the set of all consecutive-state transitions
-$(i, j, \Delta t)$ extracted from training journeys. Define:
-
+For consecutive customer-action transitions $(i,j,\Delta t)$, define
 \[
-    N_{ij} = \#\{(i,j,\cdot) \in \mathcal{D}\}, \qquad
-    T_i = \sum_{(i,j,\Delta t)\,\in\,\mathcal{D}} \Delta t
+    N_{ij} = \#\{(i,j,\cdot)\}, \qquad
+    T_i = \sum_{(i,j,\Delta t)} \Delta t.
+\]
+The maximum-likelihood CTMC generator is
+\[
+    \hat q_{ij} = \frac{N_{ij}}{T_i}, \quad i \neq j,
+    \qquad
+    \hat q_{ii} = -\sum_{j \neq i}\hat q_{ij}.
 \]
 
-The maximum-likelihood estimate of the off-diagonal rates is
+\subsection{Prediction Target}
+
+The global baseline still predicts the old target:
 \[
-    \hat{\lambda}_{ij} = \frac{N_{ij}}{T_i}, \quad i \neq j
+    \hat p_{\text{global}}(s)
+    =
+    \left[\exp(Q^* \tau)\right]_{s,28},
+    \qquad
+    \tau = 60 \cdot 86400.
 \]
-with diagonal entries set to $q_{ii} = -\sum_{j \neq i} \hat{\lambda}_{ij}$.
-Self-transitions are discarded before counting.
+Here $Q^*$ makes state 28 absorbing. This is useful as a baseline but it does
+not explicitly model inactivity failure.
 
-\subsection{Prediction}
+\section{Retained Baseline 2: Clustered CTMC}
 
-\paragraph{Absorption probability.}
-The success state $s^* = 28$ is made absorbing by zeroing row $s^*$ in $Q$.
-For a journey currently in state $s$, the predicted probability is:
+The clustered CTMC groups journeys by prefix behavior and fits one global CTMC
+per cluster:
 \[
-    \hat{p}(s) = \left[e^{Q^* \tau}\right]_{s,\,s^*}
-\]
-computed via the matrix exponential (\texttt{scipy.linalg.expm}).
-
-\paragraph{Expected hitting time.}
-For transient states $\mathcal{T} = \mathcal{S} \setminus \{s^*\}$, the
-expected time to absorption satisfies the linear system
-\[
-    Q_{\mathcal{T}} \, m = -\mathbf{1}
-\]
-where $Q_{\mathcal{T}}$ is the sub-matrix of $Q$ restricted to transient rows
-and columns. Solving gives the expected seconds to success from each state.
-
-\paragraph{Fallback.}
-If the current state of a test journey was never seen during training, the
-model falls back to the empirical success prior implied by the transition count
-table.
-
-% ============================================================
-\section{Model 2: Laplace-Smoothed Global CTMC}
-% ============================================================
-
-\subsection{Overview}
-
-The global CTMC can produce noisy rates for rarely-observed state pairs because
-$N_{ij}$ is often zero. \texttt{LaplaceGlobalCTMC} adds pseudo-counts to
-regularize the generator.
-
-\subsection{Fitting}
-
-Before computing rates, every off-diagonal count cell receives an
-$\alpha$-smoothing prior:
-\[
-    \tilde{N}_{ij} = N_{ij} + \alpha, \quad i \neq j
-\]
-with $\alpha = 0$ recovering the unsmoothed model, $\alpha = 1$ giving
-standard Laplace smoothing, and $\alpha = 0.5$ (default) corresponding to the
-Jeffreys prior. Rates are then computed as before:
-\[
-    \hat{\lambda}_{ij} = \frac{\tilde{N}_{ij}}{T_i}
+    Q^{(k)} = \texttt{GlobalCTMC.fit}(\mathcal{D}_k).
 \]
 
-\subsection{Prediction}
-
-Identical to Global CTMC. Because the generator is denser (no true zeros for
-unseen pairs), the matrix exponential tends to assign nonzero probability to
-every reachable state, reducing the variance of absorption probability
-estimates for rare states.
-
-% ============================================================
-\section{Model 3: Clustered CTMC}
-% ============================================================
-
-\subsection{Overview}
-
-Rather than pooling all journeys into one $Q$, customers are grouped into $K$
-behavioral clusters and a separate \texttt{GlobalCTMC} is fit per cluster. The
-intuition is that different customer types (e.g., browsers vs.\ decisive
-buyers) have different transition dynamics, and a per-segment $Q$ captures
-this heterogeneity.
-
-\subsection{Clustering}
-
-\paragraph{Feature extraction.} For each journey prefix, the following
-features are computed without using the outcome label (no leakage):
-\begin{itemize}
-    \item Proportion of each of the top-20 most frequent actions
-          (\texttt{action\_prop\_\{ed\_id\}}).
-    \item Entry state (\texttt{first\_state}) and current state
-          (\texttt{current\_state}).
-\end{itemize}
-
-\paragraph{K-Means.} Features are imputed (median) and standardized, then
-$K$-Means with $K=3$ clusters (default) is fit on the combined feature matrix.
-
-\subsection{Fitting}
-
-Transitions are partitioned by cluster assignment, and a \texttt{GlobalCTMC}
-is fit independently on each partition:
-\[
-    Q^{(k)} = \texttt{GlobalCTMC.fit}\!\left(\mathcal{D}_k\right), \quad
-    k = 1,\ldots,K
-\]
-
-\subsection{Prediction}
-
-At test time:
-\begin{enumerate}
-    \item Compute the same feature vector for the test journey.
-    \item Assign it to cluster $k^*$ via the fitted K-Means pipeline.
-    \item Use $Q^{(k^*)}$ to compute the absorption probability.
-    \item If $k^*$ has no fitted model (unseen cluster), fall back to the
-          global model.
-\end{enumerate}
-
-\paragraph{Blended submission.} In the final Kaggle submission, the global and
-clustered predictions are averaged:
-\[
-    \hat{p}_{\text{blend}}(s) = 0.5\,\hat{p}_{\text{global}}(s)
-    + 0.5\,\hat{p}_{\text{clustered}}(s)
-\]
-
-% ============================================================
-\section{Model 4: Calibrated CTMC}
-% ============================================================
-
-\subsection{Overview}
-
-All CTMC models output absorption probabilities that reflect dynamics in the
-\emph{training} data. Because the Kaggle test set has a much lower success
-prevalence ($\approx 5\%$) than training ($\approx 22\%$), raw probabilities
-are systematically over-confident.
-
-\texttt{CalibratedCTMC} is a post-hoc wrapper that corrects this in two
-complementary ways.
-
-\subsection{Isotonic Calibration}
-
-An isotonic regression is fit on a held-out calibration fold:
-\[
-    \hat{f} = \arg\min_{f \text{ non-decreasing}} \sum_i (y_i - f(\hat{p}_i))^2
-\]
-Because isotonic regression minimizes squared error, fitting it directly
-minimizes the Brier score on the calibration set --- the Kaggle evaluation
-metric.
-
-At test time, raw predictions are passed through $\hat{f}$:
-\[
-    \hat{p}_{\text{cal}}(s) = \hat{f}\!\left(\hat{p}_{\text{raw}}(s)\right)
-\]
-
-\subsection{Prevalence Shift (Log-Odds Adjustment)}
-
-A simpler but complementary correction is applied uniformly to all model
-outputs before submission. Let $\pi_{\text{train}}$ and $\pi_{\text{test}}$
-be the success rates in training and test respectively. Using a Bayes
-prior-probability adjustment in log-odds space:
-\[
-    r = \frac{\pi_{\text{test}} / (1 - \pi_{\text{test}})}
-             {\pi_{\text{train}} / (1 - \pi_{\text{train}})}
-    \approx 0.188
-\]
-\[
-    \hat{p}_{\text{adj}} = \frac{\hat{p} \cdot r}{\hat{p} \cdot r + (1 - \hat{p})}
-\]
-This is applied in \texttt{calibrate\_prevalence()} in
-\texttt{tabular\_submission.py} to every model's output
-($\pi_{\text{train}} = 0.2194$, $\pi_{\text{test}} = 0.05018$, estimated from
-the all-zeros Kaggle Brier score).
-
-% ============================================================
-\section{Model Hierarchy and Composition}
-% ============================================================
-
-The four models build on one another as follows:
+The implementation supports two clustering modes:
 
 \begin{center}
 \begin{tabular}{lll}
 \toprule
-Model & Builds on & Key addition \\
+Mode & Switch & Notes \\
 \midrule
-\texttt{GlobalCTMC}         & ---             & Single pooled $Q$; MLE rates \\
-\texttt{LaplaceGlobalCTMC}  & GlobalCTMC      & Add-$\alpha$ smoothing on $N_{ij}$ \\
-\texttt{ClusteredCTMC}      & GlobalCTMC      & Per-segment $Q^{(k)}$ via K-Means \\
-\texttt{CalibratedCTMC}     & Any CTMC model  & Isotonic + prevalence shift \\
+KMeans & default & Original baseline; clusters action proportions and state features. \\
+Spectral & \texttt{use\_spectral\_clustering=True} & Nearest-neighbor spectral fit plus KNN assignment for open journeys. \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-The submission pipeline (\texttt{ctmc\_submission.py}) always applies
-\texttt{calibrate\_prevalence} to all outputs. \texttt{CalibratedCTMC}
-(isotonic) is used for offline Brier diagnostics in
-\texttt{ctmc\_advanced.py}.
+The clustered CTMC also predicts the old success-hit target unless paired with
+one of the timeout-aware models below.
 
-% ============================================================
-\section{Inference Summary}
-% ============================================================
+\section{New Model 1: Timeout-Absorbing CTMC}
 
-All models share the same two prediction modes:
+\subsection{Construction}
 
-\begin{description}
-    \item[Absorption probability] $\hat{p}(s) = [e^{Q^*\tau}]_{s,s^*}$ ---
-    the direct estimate of $P(\text{success within } \tau \mid \text{current state}=s)$.
-    Used as the primary Kaggle submission score.
+The timeout transition table modifies the training data:
 
-    \item[Expected hitting time] $\hat{m}(s)$ from $Q_\mathcal{T} m = -\mathbf{1}$
-    --- used experimentally in \texttt{ctmc\_waiting\_time\_\allowbreak{}experiment.py} to
-    compare against the absorption probability as a ranking signal
-    (transformed as $e^{-\hat{m}/\tau}$).
-\end{description}
+\begin{itemize}
+    \item Customer-action transitions are kept.
+    \item Transitions into \texttt{order\_shipped}=28 are kept as success.
+    \item Each incomplete journey receives one artificial terminal transition
+          from its last customer-action state to failure state $f=-1$ after
+          60 days.
+\end{itemize}
+
+A CTMC generator is then fit on this augmented state space. Both success and
+failure are absorbing.
+
+\subsection{Prediction}
+
+For transient states $\mathcal{T} = \mathcal{S}\setminus\{28,-1\}$, the
+probability of eventually absorbing in success before failure solves
+\[
+    Q_{\mathcal{T}\mathcal{T}}u
+    =
+    -Q_{\mathcal{T},28}.
+\]
+The model returns $u_s$ for the current state $s$. This directly targets
+\[
+    P(T_{\text{success}} < T_{\text{failure}} \mid X(0)=s).
+\]
+
+\section{New Model 2: Empirical Semi-Markov Timeout Model}
+
+The semi-Markov timeout model removes the exponential waiting-time assumption.
+For each state $i$, it stores empirical outgoing samples
+\[
+    (j_m, \Delta t_m).
+\]
+The value function is updated by
+\[
+    V(i) =
+    \frac{1}{M_i}\sum_{m=1}^{M_i}
+    \begin{cases}
+        1, & j_m=28 \text{ and } \Delta t_m \leq 60\text{ days}, \\
+        0, & j_m=-1 \text{ or } \Delta t_m > 60\text{ days}, \\
+        V(j_m), & \text{otherwise.}
+    \end{cases}
+\]
+Iteration continues to convergence. This estimates success before timeout
+using the empirical waiting-time distribution rather than CTMC exponential
+holding times.
+
+\section{Active Model Set}
+
+The active CTMC comparison now contains exactly two old CTMC methods and two
+timeout-aware methods:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Model & Target & Status \\
+\midrule
+\texttt{GlobalCTMC} & hit success within 60 days & retained old baseline \\
+\texttt{ClusteredCTMC} & hit success within 60 days & retained old baseline \\
+\texttt{TimeoutAbsorbingCTMC} & success before inactivity failure & new primary CTMC target \\
+\texttt{SemiMarkovTimeoutModel} & success before inactivity failure & new non-exponential target \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Older experimental CTMC variants such as neural-rate CTMC, XGBoost-rate CTMC,
+time-stratified CTMC, Laplace-smoothed CTMC, and isotonic CTMC calibration are
+not part of the active CTMC comparison.
+
+\section{Commands}
+
+Run the retained CTMC comparison:
+\[
+\texttt{python -m src.models.ctmc\_pipeline all --no-cache}
+\]
+
+Run only spectral clustered CTMC:
+\[
+\texttt{python -m src.models.ctmc\_pipeline clustered --use-spectral-clustering --no-cache}
+\]
 
 \end{document}

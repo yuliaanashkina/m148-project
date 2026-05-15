@@ -28,7 +28,33 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_FLATTENED_PATH = DATA_DIR / "journeys_flattened.parquet"
 DEFAULT_TRAINING_PATH = DATA_DIR / "journey_training_optionA.parquet"
+DEFAULT_REALISTIC_TRAINING_PATH = DATA_DIR / "journey_training_realistic_truncation.parquet"
+DEFAULT_OPEN_REALISTIC_FEATURES_PATH = DATA_DIR / "open_journeys_realistic_features.parquet"
 DEFAULT_LABELED_PATH = DATA_DIR / "journeys_labeled.parquet"
+DEFAULT_EVENT_DEFINITIONS_PATH = DATA_DIR / "Event Definitions.csv"
+SUCCESS_STATE = 28
+FAILURE_STATE = -1
+TIMEOUT_SECONDS = 60 * 24 * 60 * 60
+
+# Customer-initiated events inferred from data/Event Definitions.csv. Company
+# responses and fulfillment/system events should not reset the inactivity clock.
+DEFAULT_CUSTOMER_ACTION_STATES = {
+    2,   # campaign_click
+    3,   # application_web_submit
+    4,   # browse_products
+    5,   # view_cart
+    6,   # begin_checkout
+    7,   # place_order_web
+    8,   # place_downpayment
+    9,   # customer_requested_catalog_digital
+    10,  # fingerhut_university
+    11,  # add_to_cart
+    18,  # place_order_phone
+    19,  # application_web_view
+    22,  # pre_application_3rd_party_affiliates
+    23,  # site_registration
+    25,  # place_downpayment_phone
+}
 
 
 def _as_seconds(values: pd.Series) -> pd.Series:
@@ -37,13 +63,39 @@ def _as_seconds(values: pd.Series) -> pd.Series:
     return seconds.clip(lower=0).fillna(0.0)
 
 
+def load_customer_action_states(
+    definitions_path: Path = DEFAULT_EVENT_DEFINITIONS_PATH,
+    include_success: bool = False,
+) -> set[int]:
+    """Return ed_ids treated as customer actions for inactivity modeling.
+
+    The CSV does not include an actor column, so this uses a conservative
+    curated set checked against Event Definitions.csv. Success can be included
+    as a terminal outcome state, but it is not considered a customer action.
+    """
+    if definitions_path.exists():
+        definitions = pd.read_csv(definitions_path)
+        known_ids = set(definitions["event_definition_id"].astype(int))
+        unknown = DEFAULT_CUSTOMER_ACTION_STATES - known_ids
+        if unknown:
+            raise ValueError(f"Customer action state ids missing from definitions: {sorted(unknown)}")
+
+    states = set(DEFAULT_CUSTOMER_ACTION_STATES)
+    if include_success:
+        states.add(SUCCESS_STATE)
+    return states
+
+
 @dataclass
 class CTMCData:
     """Loads flattened journeys and returns event-level or journey-level views."""
 
     flattened_path: Path = DEFAULT_FLATTENED_PATH
     training_path: Path = DEFAULT_TRAINING_PATH
+    realistic_training_path: Path = DEFAULT_REALISTIC_TRAINING_PATH
+    open_realistic_features_path: Path = DEFAULT_OPEN_REALISTIC_FEATURES_PATH
     labeled_path: Path = DEFAULT_LABELED_PATH
+    event_definitions_path: Path = DEFAULT_EVENT_DEFINITIONS_PATH
 
     def load_journeys(self, max_journeys: int | None = None) -> pl.DataFrame:
         q = pl.scan_parquet(self.flattened_path)
@@ -56,6 +108,15 @@ class CTMCData:
         if max_rows is not None:
             q = q.head(max_rows)
         return q.collect().drop("prefix_actions").to_pandas()
+
+    def load_realistic_snapshot_features(self, max_rows: int | None = None) -> pd.DataFrame:
+        q = pl.scan_parquet(self.realistic_training_path)
+        if max_rows is not None:
+            q = q.head(max_rows)
+        return q.collect().to_pandas()
+
+    def load_open_realistic_features(self) -> pd.DataFrame:
+        return pl.read_parquet(self.open_realistic_features_path).to_pandas()
 
     def load_neural_rate_training_features(self, max_rows: int | None = None) -> pd.DataFrame:
         """
@@ -129,7 +190,18 @@ class CTMCData:
             .to_pandas()
         )
 
-    def events(self, max_journeys: int | None = None) -> pd.DataFrame:
+    def customer_action_states(self, include_success: bool = False) -> set[int]:
+        return load_customer_action_states(
+            self.event_definitions_path,
+            include_success=include_success,
+        )
+
+    def events(
+        self,
+        max_journeys: int | None = None,
+        customer_actions_only: bool = False,
+        include_success: bool = True,
+    ) -> pd.DataFrame:
         journeys = self.load_journeys(max_journeys=max_journeys)
         events = (
             journeys.select(["id", "journey"])
@@ -139,10 +211,22 @@ class CTMCData:
         )
         pdf = events.to_pandas()
         pdf["event_timestamp"] = pd.to_datetime(pdf["event_timestamp"], utc=True)
+        if customer_actions_only:
+            state_set = self.customer_action_states(include_success=include_success)
+            pdf = pdf[pdf["ed_id"].astype(int).isin(state_set)].copy()
         return pdf
 
-    def transition_table(self, max_journeys: int | None = None) -> pd.DataFrame:
-        events = self.events(max_journeys=max_journeys)
+    def transition_table(
+        self,
+        max_journeys: int | None = None,
+        customer_actions_only: bool = True,
+        include_success: bool = True,
+    ) -> pd.DataFrame:
+        events = self.events(
+            max_journeys=max_journeys,
+            customer_actions_only=customer_actions_only,
+            include_success=include_success,
+        )
         events["next_state"] = events.groupby("id")["ed_id"].shift(-1)
         events["next_timestamp"] = events.groupby("id")["event_timestamp"].shift(-1)
         transitions = events.dropna(subset=["next_state", "next_timestamp"]).copy()
@@ -153,7 +237,190 @@ class CTMCData:
         )
         return transitions[["id", "state", "next_state", "dt_seconds"]]
 
-    def prefix_transition_table(self, max_rows: int | None = None) -> pd.DataFrame:
+    def timeout_transition_table(
+        self,
+        max_journeys: int | None = None,
+        customer_actions_only: bool = True,
+        success_state: int = SUCCESS_STATE,
+        failure_state: int = FAILURE_STATE,
+        timeout_seconds: float = TIMEOUT_SECONDS,
+    ) -> pd.DataFrame:
+        """Transitions with an explicit absorbing inactivity-failure state.
+
+        Successful journeys contribute ordinary transitions into success_state.
+        Incomplete journeys add one terminal transition from their last observed
+        modeling state to failure_state after timeout_seconds. When
+        customer_actions_only=True, company/system events are ignored as states
+        and do not reset the inactivity clock.
+        """
+        q = (
+            pl.scan_parquet(self.labeled_path)
+            .filter(pl.col("journey_status").is_in(["successful", "incomplete"]))
+            .select(["id", "journey", "journey_status"])
+        )
+        if max_journeys is not None:
+            q = q.head(max_journeys)
+
+        events = (
+            q.explode("journey")
+            .unnest("journey")
+            .sort(["id", "event_timestamp", "ed_id"])
+            .collect()
+            .to_pandas()
+        )
+        events["event_timestamp"] = pd.to_datetime(events["event_timestamp"], utc=True)
+        events["ed_id"] = events["ed_id"].astype(int)
+
+        if customer_actions_only:
+            state_set = self.customer_action_states(include_success=True)
+            events = events[events["ed_id"].isin(state_set)].copy()
+
+        events["next_state"] = events.groupby("id")["ed_id"].shift(-1)
+        events["next_timestamp"] = events.groupby("id")["event_timestamp"].shift(-1)
+        transitions = events.dropna(subset=["next_state", "next_timestamp"]).copy()
+        transitions["state"] = transitions["ed_id"].astype(int)
+        transitions["next_state"] = transitions["next_state"].astype(int)
+        transitions["dt_seconds"] = _as_seconds(
+            transitions["next_timestamp"] - transitions["event_timestamp"]
+        )
+        transitions = transitions[["id", "state", "next_state", "dt_seconds"]]
+
+        last_events = (
+            events.sort_values(["id", "event_timestamp", "ed_id"])
+            .groupby("id", as_index=False)
+            .tail(1)
+        )
+        incomplete_last = last_events[last_events["journey_status"] == "incomplete"]
+        fail_rows = pd.DataFrame(
+            {
+                "id": incomplete_last["id"].to_numpy(),
+                "state": incomplete_last["ed_id"].astype(int).to_numpy(),
+                "next_state": np.full(len(incomplete_last), failure_state, dtype=int),
+                "dt_seconds": np.full(len(incomplete_last), float(timeout_seconds)),
+            }
+        )
+        out = pd.concat([transitions, fail_rows], ignore_index=True)
+        out = out[out["state"] != out["next_state"]].copy()
+        return out[["id", "state", "next_state", "dt_seconds"]]
+
+    def suffix_timeout_transition_table(
+        self,
+        snapshots: pd.DataFrame | None = None,
+        max_rows: int | None = None,
+        customer_actions_only: bool = True,
+        success_state: int = SUCCESS_STATE,
+        failure_state: int = FAILURE_STATE,
+        timeout_seconds: float = TIMEOUT_SECONDS,
+    ) -> pd.DataFrame:
+        """Build target-aligned suffix transitions from truncated snapshots.
+
+        Each snapshot contributes transitions starting at the last observed
+        customer-action state at snapshot_time. If the next modeling event is
+        more than timeout_seconds away, the suffix absorbs in failure before
+        that event can occur.
+        """
+        if snapshots is None:
+            snapshots = self.load_realistic_snapshot_features(max_rows=max_rows)
+        elif max_rows is not None:
+            snapshots = snapshots.head(max_rows).copy()
+
+        snapshots = snapshots.copy()
+        snapshots["snapshot_time"] = pd.to_datetime(snapshots["snapshot_time"], utc=True)
+        if "snapshot_id" not in snapshots.columns:
+            snapshots["snapshot_id"] = (
+                snapshots["id"].astype(str) + "::" + snapshots["sample_num"].astype(str)
+            )
+
+        ids = pl.DataFrame({"id": snapshots["id"].drop_duplicates().to_list()}).lazy()
+        events = (
+            pl.scan_parquet(self.labeled_path)
+            .select(["id", "journey"])
+            .join(ids, on="id", how="inner")
+            .explode("journey")
+            .unnest("journey")
+            .sort(["id", "event_timestamp", "ed_id"])
+            .collect()
+            .to_pandas()
+        )
+        events["event_timestamp"] = pd.to_datetime(events["event_timestamp"], utc=True)
+        events["ed_id"] = events["ed_id"].astype(int)
+        if customer_actions_only:
+            state_set = self.customer_action_states(include_success=True)
+            events = events[events["ed_id"].isin(state_set)].copy()
+
+        events_by_id = {
+            journey_id: g.sort_values(["event_timestamp", "ed_id"])
+            for journey_id, g in events.groupby("id", sort=False)
+        }
+
+        rows = []
+        for snap in snapshots.itertuples(index=False):
+            journey_id = getattr(snap, "id")
+            snapshot_id = getattr(snap, "snapshot_id")
+            snapshot_time = getattr(snap, "snapshot_time")
+            journey_events = events_by_id.get(journey_id)
+            if journey_events is None or journey_events.empty:
+                continue
+
+            observed = journey_events[journey_events["event_timestamp"] <= snapshot_time]
+            if observed.empty:
+                continue
+
+            current_state = int(observed.iloc[-1]["ed_id"])
+            current_time = snapshot_time
+            future = journey_events[journey_events["event_timestamp"] > snapshot_time]
+            absorbed = False
+
+            for event in future.itertuples(index=False):
+                next_state = int(event.ed_id)
+                next_time = event.event_timestamp
+                gap = max((next_time - current_time).total_seconds(), 0.0)
+                if gap > timeout_seconds:
+                    rows.append({
+                        "snapshot_id": snapshot_id,
+                        "id": journey_id,
+                        "state": current_state,
+                        "next_state": failure_state,
+                        "dt_seconds": float(timeout_seconds),
+                    })
+                    absorbed = True
+                    break
+
+                rows.append({
+                    "snapshot_id": snapshot_id,
+                    "id": journey_id,
+                    "state": current_state,
+                    "next_state": next_state,
+                    "dt_seconds": gap,
+                })
+                if next_state == success_state:
+                    absorbed = True
+                    break
+                current_state = next_state
+                current_time = next_time
+
+            if not absorbed:
+                rows.append({
+                    "snapshot_id": snapshot_id,
+                    "id": journey_id,
+                    "state": current_state,
+                    "next_state": failure_state,
+                    "dt_seconds": float(timeout_seconds),
+                })
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return pd.DataFrame(columns=["snapshot_id", "id", "state", "next_state", "dt_seconds"])
+        return out[out["state"] != out["next_state"]][
+            ["snapshot_id", "id", "state", "next_state", "dt_seconds"]
+        ].reset_index(drop=True)
+
+    def prefix_transition_table(
+        self,
+        max_rows: int | None = None,
+        customer_actions_only: bool = True,
+        include_success: bool = True,
+    ) -> pd.DataFrame:
         """Transition table from truncated journey prefixes — no label leakage.
 
         Reconstructs events up to the 70%-snapshot cutpoint from journeys_labeled.parquet
@@ -178,6 +445,9 @@ class CTMCData:
         )
         pdf = events.to_pandas()
         pdf["event_timestamp"] = pd.to_datetime(pdf["event_timestamp"], utc=True)
+        if customer_actions_only:
+            state_set = self.customer_action_states(include_success=include_success)
+            pdf = pdf[pdf["ed_id"].astype(int).isin(state_set)].copy()
         pdf["next_state"] = pdf.groupby("id")["ed_id"].shift(-1)
         pdf["next_timestamp"] = pdf.groupby("id")["event_timestamp"].shift(-1)
         transitions = pdf.dropna(subset=["next_state", "next_timestamp"]).copy()
@@ -330,6 +600,191 @@ class GlobalCTMC:
     def _check_fit(self) -> None:
         if self.Q_ is None:
             raise RuntimeError("Call fit() before reading CTMC outputs.")
+
+
+class TimeoutAbsorbingCTMC(GlobalCTMC):
+    """CTMC for P(success before 60-day inactivity failure).
+
+    Fit this on CTMCData.timeout_transition_table(), which adds an explicit
+    absorbing failure state for incomplete journeys. Prediction solves the
+    absorbing CTMC linear system instead of asking only whether success is hit
+    within a fixed calendar horizon.
+    """
+
+    def __init__(
+        self,
+        success_state: int = SUCCESS_STATE,
+        failure_state: int = FAILURE_STATE,
+        min_time: float = 1e-9,
+    ) -> None:
+        super().__init__(min_time=min_time)
+        self.success_state = success_state
+        self.failure_state = failure_state
+        self.absorption_by_state_: dict[int, float] = {}
+        self.fallback_: float = 0.0
+
+    def fit(self, transitions: pd.DataFrame) -> "TimeoutAbsorbingCTMC":
+        super().fit(transitions)
+        self._fit_absorption_probabilities()
+        return self
+
+    def predict_success_probability(
+        self,
+        current_states: Iterable[int],
+        success_state: int | None = None,
+        horizon_seconds: float | None = None,
+    ) -> np.ndarray:
+        return self.absorption_probability(
+            current_states,
+            success_state=success_state or self.success_state,
+            horizon_seconds=TIMEOUT_SECONDS if horizon_seconds is None else horizon_seconds,
+        )
+
+    def absorption_probability(
+        self,
+        current_states: Iterable[int],
+        success_state: int = SUCCESS_STATE,
+        horizon_seconds: float = TIMEOUT_SECONDS,
+    ) -> np.ndarray:
+        self._check_fit()
+        probs = [
+            self.absorption_by_state_.get(int(state), self.fallback_)
+            for state in current_states
+        ]
+        return np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
+
+    def _fit_absorption_probabilities(self) -> None:
+        if self.Q_ is None:
+            raise RuntimeError("Call fit() before computing absorption probabilities.")
+
+        success = self.success_state
+        failure = self.failure_state
+        self.absorption_by_state_ = {success: 1.0, failure: 0.0}
+
+        transient = [s for s in self.states_ if s not in {success, failure}]
+        if transient and success in self.Q_.columns:
+            q_tt = self.Q_.loc[transient, transient].to_numpy(dtype=float)
+            q_ts = self.Q_.loc[transient, success].to_numpy(dtype=float)
+            try:
+                probs = np.linalg.solve(q_tt, -q_ts)
+            except np.linalg.LinAlgError:
+                probs = np.linalg.lstsq(q_tt, -q_ts, rcond=None)[0]
+            for state, prob in zip(transient, probs):
+                self.absorption_by_state_[state] = float(np.clip(prob, 0.0, 1.0))
+
+        if self.transition_counts_ is not None:
+            success_hits = (
+                float(self.transition_counts_[success].sum())
+                if success in self.transition_counts_.columns else 0.0
+            )
+            fail_hits = (
+                float(self.transition_counts_[failure].sum())
+                if failure in self.transition_counts_.columns else 0.0
+            )
+            denom = success_hits + fail_hits
+            self.fallback_ = success_hits / denom if denom > 0 else 0.0
+
+
+class SemiMarkovTimeoutModel:
+    """Empirical semi-Markov model for success before inactivity timeout.
+
+    This model does not assume exponential waiting times. It treats each
+    observed outgoing transition as an empirical sample: if the next action
+    occurs within timeout_seconds, the process moves to that next state; if no
+    action occurs for timeout_seconds, it absorbs in failure.
+    """
+
+    def __init__(
+        self,
+        success_state: int = SUCCESS_STATE,
+        failure_state: int = FAILURE_STATE,
+        timeout_seconds: float = TIMEOUT_SECONDS,
+        max_iter: int = 500,
+        tol: float = 1e-10,
+    ) -> None:
+        self.success_state = success_state
+        self.failure_state = failure_state
+        self.timeout_seconds = timeout_seconds
+        self.max_iter = max_iter
+        self.tol = tol
+        self.states_: list[int] = []
+        self.samples_: pd.DataFrame | None = None
+        self.success_prob_by_state_: dict[int, float] = {}
+        self.fallback_: float = 0.0
+
+    def fit(self, transitions: pd.DataFrame) -> "SemiMarkovTimeoutModel":
+        df = transitions.copy()
+        df = df[df["state"] != df["next_state"]].copy()
+        df["state"] = df["state"].astype(int)
+        df["next_state"] = df["next_state"].astype(int)
+        df["dt_seconds"] = pd.to_numeric(df["dt_seconds"], errors="coerce").fillna(0.0)
+        self.samples_ = df
+        self.states_ = sorted(set(df["state"]).union(set(df["next_state"])))
+        self._fit_value_function()
+        return self
+
+    def predict_success_probability(
+        self,
+        current_states: Iterable[int],
+        success_state: int | None = None,
+        horizon_seconds: float | None = None,
+    ) -> np.ndarray:
+        probs = [
+            self.success_prob_by_state_.get(int(state), self.fallback_)
+            for state in current_states
+        ]
+        return np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
+
+    def _fit_value_function(self) -> None:
+        if self.samples_ is None:
+            raise RuntimeError("Call fit() before computing success probabilities.")
+
+        grouped = {
+            int(state): g[["next_state", "dt_seconds"]].to_numpy()
+            for state, g in self.samples_.groupby("state", sort=False)
+        }
+        values = {
+            state: 0.5
+            for state in self.states_
+            if state not in {self.success_state, self.failure_state}
+        }
+        values[self.success_state] = 1.0
+        values[self.failure_state] = 0.0
+
+        for _ in range(self.max_iter):
+            delta = 0.0
+            updated = values.copy()
+            for state, rows in grouped.items():
+                if state in {self.success_state, self.failure_state}:
+                    continue
+                sample_values = []
+                for next_state, dt_seconds in rows:
+                    next_state = int(next_state)
+                    if float(dt_seconds) > self.timeout_seconds:
+                        sample_values.append(0.0)
+                    elif next_state == self.success_state:
+                        sample_values.append(1.0)
+                    elif next_state == self.failure_state:
+                        sample_values.append(0.0)
+                    else:
+                        sample_values.append(values.get(next_state, self.fallback_))
+                new_value = float(np.mean(sample_values)) if sample_values else self.fallback_
+                updated[state] = new_value
+                delta = max(delta, abs(new_value - values.get(state, 0.0)))
+            values = updated
+            if delta < self.tol:
+                break
+
+        terminal = self.samples_[self.samples_["next_state"].isin([self.success_state, self.failure_state])]
+        denom = len(terminal)
+        self.fallback_ = (
+            float((terminal["next_state"] == self.success_state).mean())
+            if denom > 0 else 0.0
+        )
+        self.success_prob_by_state_ = {
+            int(state): float(np.clip(prob, 0.0, 1.0))
+            for state, prob in values.items()
+        }
 
 
 class JourneyFeatureBuilder:
@@ -496,44 +951,111 @@ class JourneyFeatureBuilder:
 
 
 class ClusteredCTMC:
-    """Cluster journeys, then fit one GlobalCTMC generator per cluster."""
+    """Cluster journeys, then fit one GlobalCTMC generator per cluster.
 
-    def __init__(self, n_clusters: int = 3, random_state: int = 42) -> None:
+    Set use_spectral_clustering=True to replace the original KMeans segmenter
+    with nearest-neighbor spectral clustering. SpectralClustering has no
+    predict() method, so fitting also trains a KNN assignment model in the same
+    preprocessed feature space for future/open journeys.
+    """
+
+    def __init__(
+        self,
+        n_clusters: int = 3,
+        random_state: int = 42,
+        use_spectral_clustering: bool = False,
+        cluster_feature_mode: str = "auto",
+        spectral_n_neighbors: int = 20,
+        spectral_assign_neighbors: int = 25,
+        spectral_max_fit_rows: int = 25_000,
+    ) -> None:
         self.n_clusters = n_clusters
         self.random_state = random_state
+        self.use_spectral_clustering = use_spectral_clustering
+        self.cluster_feature_mode = cluster_feature_mode
+        self.spectral_n_neighbors = spectral_n_neighbors
+        self.spectral_assign_neighbors = spectral_assign_neighbors
+        self.spectral_max_fit_rows = spectral_max_fit_rows
         self.feature_builder = JourneyFeatureBuilder()
         self.models_: dict[int, GlobalCTMC] = {}
         self.assignments_: pd.DataFrame | None = None
         self.pipeline_ = None
+        self.clusterer_ = None
+        self.assignment_model_ = None
         self.feature_columns_: list[str] = []
         self.cluster_columns_: list[str] = []
 
     def fit(self, transitions: pd.DataFrame) -> "ClusteredCTMC":
-        from sklearn.cluster import KMeans
+        from sklearn.cluster import KMeans, SpectralClustering
         from sklearn.impute import SimpleImputer
+        from sklearn.neighbors import KNeighborsClassifier, kneighbors_graph
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import StandardScaler
+        from scipy.sparse.csgraph import connected_components
+
+        self.models_ = {}
+        self.assignment_model_ = None
 
         features = self.feature_builder.fit_transform(transitions)
         x = features.drop(columns=["id"])
         self.feature_columns_ = x.columns.tolist()
+        self.cluster_columns_ = self._select_cluster_columns(x)
 
-        # Cluster on action proportions + entry/current state only.
-        # This captures behavioral pattern (not journey intensity), giving
-        # clusters whose per-segment Q matrices differ in meaningful ways.
-        prop_cols = [c for c in x.columns if c.startswith("action_prop_")]
-        state_cols = [c for c in ["first_state", "current_state"] if c in x.columns]
-        cluster_cols = prop_cols + state_cols
-        self.cluster_columns_ = cluster_cols if cluster_cols else self.feature_columns_
-
+        x_cluster = self._aligned_cluster_frame(x)
         self.pipeline_ = Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
-                ("cluster", KMeans(n_clusters=self.n_clusters, random_state=self.random_state, n_init=10)),
             ]
         )
-        clusters = self.pipeline_.fit_predict(x[self.cluster_columns_])
+        x_prepared = self.pipeline_.fit_transform(x_cluster)
+
+        if self.use_spectral_clustering:
+            fit_idx = np.arange(len(x_cluster))
+            if len(fit_idx) > self.spectral_max_fit_rows:
+                rng = np.random.default_rng(self.random_state)
+                fit_idx = np.sort(
+                    rng.choice(fit_idx, size=self.spectral_max_fit_rows, replace=False)
+                )
+            x_spectral = x_prepared[fit_idx]
+            if self.n_clusters > len(x_spectral):
+                raise ValueError("n_clusters cannot exceed the number of spectral fit rows.")
+
+            n_neighbors = SnapshotFeatureClusteredCTMC._connected_neighbor_count(
+                x_spectral,
+                initial=self.spectral_n_neighbors,
+                max_neighbors=min(150, max(1, len(x_spectral) - 1)),
+                kneighbors_graph=kneighbors_graph,
+                connected_components=connected_components,
+            )
+            self.clusterer_ = SpectralClustering(
+                n_clusters=self.n_clusters,
+                affinity="nearest_neighbors",
+                n_neighbors=n_neighbors,
+                assign_labels="kmeans",
+                random_state=self.random_state,
+                n_init=10,
+            )
+            spectral_labels = self.clusterer_.fit_predict(x_spectral)
+
+            assign_neighbors = min(
+                max(1, self.spectral_assign_neighbors),
+                max(1, len(x_spectral)),
+            )
+            self.assignment_model_ = KNeighborsClassifier(
+                n_neighbors=assign_neighbors,
+                weights="distance",
+            )
+            self.assignment_model_.fit(x_spectral, spectral_labels)
+            clusters = self.assignment_model_.predict(x_prepared)
+        else:
+            self.clusterer_ = KMeans(
+                n_clusters=self.n_clusters,
+                random_state=self.random_state,
+                n_init=10,
+            )
+            clusters = self.clusterer_.fit_predict(x_prepared)
+
         assignments = features[["id"]].copy()
         assignments["cluster"] = clusters
         self.assignments_ = assignments
@@ -542,6 +1064,39 @@ class ClusteredCTMC:
         for cluster_id, g in clustered_transitions.groupby("cluster"):
             self.models_[int(cluster_id)] = GlobalCTMC().fit(g)
         return self
+
+    def _select_cluster_columns(self, x: pd.DataFrame) -> list[str]:
+        if self.cluster_feature_mode not in {"auto", "all_numeric"}:
+            raise ValueError("cluster_feature_mode must be 'auto' or 'all_numeric'")
+
+        numeric_cols = x.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+        if not numeric_cols:
+            raise ValueError("No numeric journey features available for clustering.")
+
+        if self.cluster_feature_mode == "all_numeric":
+            return numeric_cols
+
+        prop_cols = [c for c in numeric_cols if c.startswith("action_prop_")]
+        state_cols = [c for c in ["first_state", "current_state"] if c in numeric_cols]
+        if not self.use_spectral_clustering:
+            # Preserve the original KMeans feature surface by default.
+            return prop_cols + state_cols if prop_cols or state_cols else numeric_cols
+
+        direct_success_cols = {"time_to_action_28", "seen_action_28"}
+        stable_prefix_cols = [
+            c for c in numeric_cols
+            if c not in direct_success_cols
+            and not c.startswith("label")
+            and c != "final_outcome"
+        ]
+        return stable_prefix_cols if stable_prefix_cols else numeric_cols
+
+    def _aligned_cluster_frame(self, features: pd.DataFrame) -> pd.DataFrame:
+        x = pd.DataFrame(index=features.index)
+        for col in self.cluster_columns_:
+            x[col] = features[col] if col in features.columns else 0.0
+        x = x.apply(pd.to_numeric, errors="coerce")
+        return x.replace([np.inf, -np.inf], np.nan)
 
     def cluster_summary(self) -> pd.DataFrame:
         if self.assignments_ is None:
@@ -555,10 +1110,15 @@ class ClusteredCTMC:
         )
 
     def predict_clusters(self, features: pd.DataFrame) -> np.ndarray:
-        if self.pipeline_ is None:
+        if self.pipeline_ is None or self.clusterer_ is None:
             raise RuntimeError("Call fit() before predicting clusters.")
-        cols = self.cluster_columns_ if self.cluster_columns_ else self.feature_columns_
-        return self.pipeline_.predict(features[cols])
+        x = self._aligned_cluster_frame(features)
+        x_prepared = self.pipeline_.transform(x)
+        if self.use_spectral_clustering:
+            if self.assignment_model_ is None:
+                raise RuntimeError("Spectral assignment model is missing; refit the model.")
+            return self.assignment_model_.predict(x_prepared)
+        return self.clusterer_.predict(x_prepared)
 
     def predict_success_probability(
         self,
@@ -599,6 +1159,188 @@ class ClusteredCTMC:
                 success_state=success_state,
             )
         return times
+
+
+class SnapshotFeatureClusteredCTMC:
+    """Cluster truncated snapshots using fully preprocessed features.
+
+    Clustering uses the realistic truncation feature table, while each cluster
+    gets a TimeoutAbsorbingCTMC fit on suffix transitions after the snapshot.
+    """
+
+    def __init__(
+        self,
+        n_clusters: int = 3,
+        random_state: int = 42,
+        use_spectral_clustering: bool = False,
+        spectral_n_neighbors: int = 50,
+        spectral_assign_neighbors: int = 25,
+        spectral_max_fit_rows: int = 25_000,
+    ) -> None:
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.use_spectral_clustering = use_spectral_clustering
+        self.spectral_n_neighbors = spectral_n_neighbors
+        self.spectral_assign_neighbors = spectral_assign_neighbors
+        self.spectral_max_fit_rows = spectral_max_fit_rows
+        self.feature_columns_: list[str] = []
+        self.encoded_columns_: list[str] = []
+        self.pipeline_ = None
+        self.clusterer_ = None
+        self.assignment_model_ = None
+        self.assignments_: pd.DataFrame | None = None
+        self.models_: dict[int, TimeoutAbsorbingCTMC] = {}
+        self.global_fallback_: TimeoutAbsorbingCTMC | None = None
+
+    def fit(
+        self,
+        snapshots: pd.DataFrame,
+        suffix_transitions: pd.DataFrame,
+    ) -> "SnapshotFeatureClusteredCTMC":
+        from sklearn.cluster import KMeans, SpectralClustering
+        from sklearn.impute import SimpleImputer
+        from sklearn.neighbors import KNeighborsClassifier, kneighbors_graph
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        from scipy.sparse.csgraph import connected_components
+
+        self.models_ = {}
+        self.assignment_model_ = None
+
+        features = snapshots.copy()
+        if "snapshot_id" not in features.columns:
+            features["snapshot_id"] = (
+                features["id"].astype(str) + "::" + features["sample_num"].astype(str)
+            )
+
+        x = self._feature_frame(features, fit=True)
+        self.pipeline_ = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ])
+        x_prepared = self.pipeline_.fit_transform(x)
+
+        if self.use_spectral_clustering:
+            fit_idx = np.arange(len(x_prepared))
+            if len(fit_idx) > self.spectral_max_fit_rows:
+                rng = np.random.default_rng(self.random_state)
+                fit_idx = np.sort(
+                    rng.choice(fit_idx, size=self.spectral_max_fit_rows, replace=False)
+                )
+            x_spectral = x_prepared[fit_idx]
+            n_neighbors = self._connected_neighbor_count(
+                x_spectral,
+                initial=self.spectral_n_neighbors,
+                max_neighbors=min(150, max(1, len(x_spectral) - 1)),
+                kneighbors_graph=kneighbors_graph,
+                connected_components=connected_components,
+            )
+            self.clusterer_ = SpectralClustering(
+                n_clusters=self.n_clusters,
+                affinity="nearest_neighbors",
+                n_neighbors=n_neighbors,
+                assign_labels="kmeans",
+                random_state=self.random_state,
+                n_init=10,
+            )
+            labels_fit = self.clusterer_.fit_predict(x_spectral)
+            assign_neighbors = min(
+                max(1, self.spectral_assign_neighbors),
+                max(1, len(x_spectral)),
+            )
+            self.assignment_model_ = KNeighborsClassifier(
+                n_neighbors=assign_neighbors,
+                weights="distance",
+            )
+            self.assignment_model_.fit(x_spectral, labels_fit)
+            clusters = self.assignment_model_.predict(x_prepared)
+        else:
+            self.clusterer_ = KMeans(
+                n_clusters=self.n_clusters,
+                random_state=self.random_state,
+                n_init=10,
+            )
+            clusters = self.clusterer_.fit_predict(x_prepared)
+
+        assignments = features[["snapshot_id"]].copy()
+        assignments["cluster"] = clusters
+        self.assignments_ = assignments
+
+        self.global_fallback_ = TimeoutAbsorbingCTMC().fit(suffix_transitions)
+        clustered_transitions = suffix_transitions.merge(assignments, on="snapshot_id", how="inner")
+        for cluster_id, group in clustered_transitions.groupby("cluster"):
+            self.models_[int(cluster_id)] = TimeoutAbsorbingCTMC().fit(group)
+        return self
+
+    def predict_success_probability(self, snapshots: pd.DataFrame) -> np.ndarray:
+        if self.global_fallback_ is None:
+            raise RuntimeError("Call fit() before predicting.")
+        clusters = self.predict_clusters(snapshots)
+        current_states = snapshots["current_state"] if "current_state" in snapshots.columns else snapshots["last_ed_id"]
+        probs = np.zeros(len(snapshots), dtype=float)
+        for cluster_id in sorted(set(clusters)):
+            mask = clusters == cluster_id
+            model = self.models_.get(int(cluster_id), self.global_fallback_)
+            probs[mask] = model.predict_success_probability(current_states.loc[mask])
+        return np.clip(probs, 0.0, 1.0)
+
+    def predict_clusters(self, snapshots: pd.DataFrame) -> np.ndarray:
+        if self.pipeline_ is None or self.clusterer_ is None:
+            raise RuntimeError("Call fit() before predicting clusters.")
+        x = self._feature_frame(snapshots, fit=False)
+        x_prepared = self.pipeline_.transform(x)
+        if self.use_spectral_clustering:
+            if self.assignment_model_ is None:
+                raise RuntimeError("Spectral assignment model is missing.")
+            return self.assignment_model_.predict(x_prepared)
+        return self.clusterer_.predict(x_prepared)
+
+    def cluster_summary(self) -> pd.DataFrame:
+        if self.assignments_ is None:
+            raise RuntimeError("Call fit() before reading cluster summaries.")
+        return (
+            self.assignments_["cluster"]
+            .value_counts()
+            .sort_index()
+            .rename_axis("cluster")
+            .reset_index(name="n_snapshots")
+        )
+
+    def _feature_frame(self, snapshots: pd.DataFrame, fit: bool) -> pd.DataFrame:
+        drop_cols = {
+            "id", "sample_num", "snapshot_id", "journey_status", "source_table",
+            "label", "snapshot_time", "first_event_time", "last_event_time",
+            "prefix_actions",
+        }
+        base = snapshots.drop(columns=[c for c in drop_cols if c in snapshots.columns]).copy()
+        encoded = pd.get_dummies(base, dummy_na=True)
+        encoded = encoded.apply(pd.to_numeric, errors="coerce")
+        if fit:
+            self.encoded_columns_ = encoded.columns.tolist()
+            return encoded.replace([np.inf, -np.inf], np.nan)
+        for col in self.encoded_columns_:
+            if col not in encoded.columns:
+                encoded[col] = 0.0
+        return encoded[self.encoded_columns_].replace([np.inf, -np.inf], np.nan)
+
+    @staticmethod
+    def _connected_neighbor_count(
+        x,
+        initial: int,
+        max_neighbors: int,
+        kneighbors_graph,
+        connected_components,
+    ) -> int:
+        if len(x) <= 2:
+            return 1
+        n_neighbors = min(max(1, initial), max_neighbors)
+        while n_neighbors < max_neighbors:
+            graph = kneighbors_graph(x, n_neighbors=n_neighbors, include_self=False)
+            n_components, _ = connected_components(graph, directed=False)
+            if n_components == 1:
+                return n_neighbors
+            n_neighbors = min(max_neighbors, max(n_neighbors + 1, int(n_neighbors * 1.5)))
+        return n_neighbors
 
 
 class XGBoostRateCTMC:
