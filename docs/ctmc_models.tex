@@ -106,12 +106,15 @@ per cluster:
 The implementation supports two clustering modes:
 
 \begin{center}
-\begin{tabular}{lll}
+\begin{tabular}{p{0.15\linewidth}p{0.43\linewidth}p{0.30\linewidth}}
 \toprule
 Mode & Switch & Notes \\
 \midrule
-KMeans & default & Original baseline; clusters action proportions and state features. \\
-Spectral & \texttt{use\_spectral\_clustering=True} & Nearest-neighbor spectral fit plus KNN assignment for open journeys. \\
+KMeans & default &
+Original baseline; clusters action proportions and state features. \\
+Spectral &
+\texttt{use\_spectral\_clustering=True} &
+Nearest-neighbor spectral fit plus KNN assignment. \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -152,12 +155,71 @@ The model returns $u_s$ for the current state $s$. This directly targets
 
 \section{New Model 2: Empirical Semi-Markov Timeout Model}
 
-The semi-Markov timeout model removes the exponential waiting-time assumption.
-For each state $i$, it stores empirical outgoing samples
+\subsection{Motivation}
+
+The timeout-absorbing CTMC is still a continuous-time Markov chain. Once a
+journey is in state $i$, it assumes the waiting time until the next transition
+is exponential with rate
 \[
-    (j_m, \Delta t_m).
+    \lambda_i = -q_{ii}.
 \]
-The value function is updated by
+This is mathematically convenient, but it imposes the memoryless property:
+conditional on still being in state $i$, the remaining waiting-time
+distribution is the same no matter how long the journey has already waited in
+that state.
+
+The empirical Semi-Markov timeout model is a less parametric state-based
+alternative. It keeps the same customer-action state space and the same
+absorbing outcomes, but it does not estimate a generator matrix $Q$ and does
+not assume exponential holding times. Instead, it uses the empirical
+distribution of observed next events and observed waits after each state.
+
+\subsection{Training Samples}
+
+For each observed transition out of state $i$, the model stores a sample
+\[
+    (j_m, \Delta t_m),
+\]
+where $j_m$ is the next observed modeling state and $\Delta t_m$ is the elapsed
+time until that next state. These samples come from the same timeout-aware
+transition table used by the timeout-absorbing CTMC. Therefore:
+
+\begin{itemize}
+    \item transitions into \texttt{order\_shipped}=28 are success samples;
+    \item transitions into the artificial state $-1$ are inactivity-failure
+          samples;
+    \item waits longer than 60 days are treated as timeout failures even if an
+          eventual later action exists in the raw data.
+\end{itemize}
+
+For example, from a state such as \texttt{view\_cart}, the model may have many
+historical samples of the form
+\[
+    \texttt{view\_cart}
+    \rightarrow
+    \{\texttt{begin\_checkout}, \texttt{add\_to\_cart},
+    \texttt{order\_shipped}, -1\},
+\]
+each with its own observed waiting time. The model uses these samples directly
+rather than compressing them into one exponential rate.
+
+\subsection{Value Function}
+
+The model estimates
+\[
+    V(i) = P(\text{eventually ship before inactivity failure}\mid X=i).
+\]
+The absorbing boundary values are fixed:
+\[
+    V(28)=1,
+    \qquad
+    V(-1)=0.
+\]
+For a nonterminal state $i$, let
+\[
+    \mathcal{D}_i = \{(j_m,\Delta t_m): m=1,\ldots,M_i\}
+\]
+be the empirical outgoing samples from state $i$. The value update is
 \[
     V(i) =
     \frac{1}{M_i}\sum_{m=1}^{M_i}
@@ -167,9 +229,74 @@ The value function is updated by
         V(j_m), & \text{otherwise.}
     \end{cases}
 \]
-Iteration continues to convergence. This estimates success before timeout
-using the empirical waiting-time distribution rather than CTMC exponential
-holding times.
+The implementation initializes the nonterminal values and repeatedly applies
+this update until the values stabilize. This is analogous to solving an
+absorbing Markov reward/value equation, except that the transition mechanism is
+estimated from empirical next-step samples and empirical holding times rather
+than from a CTMC generator.
+
+\subsection{Is This a Markov Chain?}
+
+Strictly speaking, this model is not a CTMC, because it does not use
+exponential holding times and does not define a generator matrix $Q$. It is
+also not a discrete-time Markov chain in the simplest textbook sense, because
+each transition sample includes a duration $\Delta t_m$ and the timeout rule
+depends on that duration.
+
+It is best described as a \emph{state-based empirical semi-Markov model}. It is
+``Markov'' in the sense that its prediction uses the current state $i$ as the
+state variable, and the future is summarized through empirical outcomes
+observed after visits to that state. It is ``semi-Markov'' because the next
+state and the waiting time are modeled jointly through samples
+$(j_m,\Delta t_m)$ rather than through memoryless exponential holding times.
+
+\subsection{Does It Use More History Than the Current Event?}
+
+In the current implementation, no. At prediction time the model only receives
+the current modeling state, i.e. the most recent customer-action event. It does
+not condition on the full prefix, the number of prior actions, the elapsed age
+of the journey, recency, user-specific covariates, or the previous sequence of
+states.
+
+Historical data are used during fitting to estimate the empirical outgoing
+sample distribution for each state. But once the model is fit, two open
+journeys whose current state is \texttt{view\_cart} receive the same
+Semi-Markov score, even if one arrived there after one click and another
+arrived there after a long complex path. This makes the model interpretable and
+strong as a state-based benchmark, but it is not personalized. Models such as
+the truncated-snapshot clustered CTMC are designed to use richer prefix history.
+
+\subsection{Comparison to Timeout-Absorbing CTMC}
+
+The timeout-absorbing CTMC asks:
+\[
+    \text{Given fitted transition rates } q_{ij}, \text{ what is }
+    P(T_{\text{success}} < T_{\text{failure}})?
+\]
+The Semi-Markov model asks:
+
+\begin{quote}
+Given the empirical next-step outcomes after this state, what fraction of
+future paths lead to success before timeout?
+\end{quote}
+
+The tradeoff is therefore:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Model & Waiting-time assumption & Extra history? \\
+\midrule
+Timeout-Absorbing CTMC & exponential / memoryless & no \\
+Empirical Semi-Markov Timeout & empirical waits by state & no \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The Semi-Markov model can be more realistic when customer waits are not well
+described by an exponential distribution. However, because it uses empirical
+samples state-by-state, rare states can be noisier than in the smoother CTMC
+rate model.
 
 \section{Active Model Set}
 
@@ -201,8 +328,9 @@ Run the retained CTMC comparison:
 \]
 
 Run only spectral clustered CTMC:
-\[
-\texttt{python -m src.models.ctmc\_pipeline clustered --use-spectral-clustering --no-cache}
-\]
+\begin{flushleft}
+\texttt{python -m src.models.ctmc\_pipeline clustered}\\
+\texttt{\quad --use-spectral-clustering --no-cache}
+\end{flushleft}
 
 \end{document}

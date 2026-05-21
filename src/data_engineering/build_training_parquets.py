@@ -371,10 +371,23 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     labeled_path = data_dir / "journeys_labeled.parquet"
+    effective_realistic_max_journeys = opts.realistic_max_journeys
     if opts.only_realistic:
         if not labeled_path.exists():
             raise FileNotFoundError(f"Missing {labeled_path}; run without --only-realistic first.")
-        labeled = pl.read_parquet(labeled_path)
+        if opts.realistic_max_journeys is not None:
+            # Avoid materializing the full nested journey table just to run a
+            # bounded smoke/test build.  The parquet is hundreds of MB and can
+            # put memory pressure on smaller machines before batching begins.
+            labeled = (
+                pl.scan_parquet(labeled_path)
+                .filter(pl.col("journey_status").is_in(["successful", "incomplete"]))
+                .head(opts.realistic_max_journeys)
+                .collect()
+            )
+            effective_realistic_max_journeys = None
+        else:
+            labeled = pl.read_parquet(labeled_path)
         if not _journey_struct_has_event_name(labeled):
             raise ValueError(
                 f"{labeled_path} was built before journey structs included event_name. "
@@ -391,7 +404,7 @@ def main(argv: list[str] | None = None) -> None:
         random_state=opts.random_state,
         max_samples_per_journey=opts.max_samples_per_journey,
         top_n_events=opts.top_n_events,
-        max_journeys=opts.realistic_max_journeys,
+        max_journeys=effective_realistic_max_journeys,
         batch_size=opts.realistic_batch_size,
         resume=opts.resume_realistic,
     )
