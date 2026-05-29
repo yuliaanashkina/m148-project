@@ -350,15 +350,36 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--only-open-realistic",
         action="store_true",
-        help="Only rebuild cached realistic features for open_journeys1.csv.",
+        help="Only rebuild cached realistic features for an open journey CSV.",
+    )
+    parser.add_argument(
+        "--open-csv",
+        type=Path,
+        default=None,
+        help="Open journey CSV used for cached realistic features.",
+    )
+    parser.add_argument(
+        "--open-realistic-output",
+        type=Path,
+        default=None,
+        help="Output parquet path for cached open realistic features.",
     )
     opts = parser.parse_args(argv)
 
     data_dir: Path = opts.data_dir
+    open_csv = opts.open_csv or data_dir / "open_journeys1.csv"
+    open_realistic_output = (
+        opts.open_realistic_output
+        or data_dir / (
+            "open_journeys_realistic_features.parquet"
+            if open_csv.name == "open_journeys1.csv"
+            else f"{open_csv.stem}_realistic_features.parquet"
+        )
+    )
     if opts.only_open_realistic:
         build_open_realistic_features(
-            data_dir / "open_journeys1.csv",
-            data_dir / "open_journeys_realistic_features.parquet",
+            open_csv,
+            open_realistic_output,
         )
         print("\nDone. Run ctmc_pipeline truncated to score cached open features.")
         return
@@ -413,8 +434,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     build_open_realistic_features(
-        data_dir / "open_journeys1.csv",
-        data_dir / "open_journeys_realistic_features.parquet",
+        open_csv,
+        open_realistic_output,
     )
     print("\nDone. Run ctmc_submission.py to generate Kaggle submissions.")
 

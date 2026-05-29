@@ -153,7 +153,69 @@ The model returns $u_s$ for the current state $s$. This directly targets
     P(T_{\text{success}} < T_{\text{failure}} \mid X(0)=s).
 \]
 
-\section{New Model 2: Empirical Semi-Markov Timeout Model}
+\section{New Model 2: Piecewise Time-Varying Timeout CTMC}
+
+\subsection{Motivation}
+
+The timeout-absorbing CTMC assumes one fixed generator matrix $Q$ for the whole
+journey. This can average together different behavioral regimes. In practice,
+customer behavior may change with journey age: very early journeys are often
+application or browsing heavy, while older journeys are more likely to decay
+toward inactivity.
+
+The piecewise time-varying model approximates a non-homogeneous CTMC by using
+one generator matrix per journey-age window:
+\[
+    Q(t)=Q_b
+    \quad \text{when } t \in I_b .
+\]
+The default bins are
+\[
+    [0,1\text{d}),\ [1,7\text{d}),\ [7,30\text{d}),\
+    [30,60\text{d}),\ [60\text{d},\infty).
+\]
+
+\subsection{Fitting}
+
+For each timeout-aware transition $(i,j,\Delta t)$, the model tracks the
+cumulative journey age at the start and end of the dwell interval. Exposure
+time in state $i$ is split across any bins crossed by that interval. The jump
+count $i\to j$ is assigned to the bin where the jump occurs. Thus, in bin $b$,
+\[
+    \hat q^{(b)}_{ij}
+    =
+    \frac{N_b(i,j)}{T_b(i)},
+    \qquad i\neq j,
+\]
+where $T_b(i)$ is the total exposure time spent in state $i$ during age window
+$b$, and $N_b(i,j)$ is the number of observed jumps from $i$ to $j$ whose jump
+time falls in that same window. The diagonal is again set by
+\[
+    \hat q^{(b)}_{ii}=-\sum_{j\neq i}\hat q^{(b)}_{ij}.
+\]
+Rows with too little bin-specific data fall back to the corresponding row of
+the global timeout-aware generator. The success state \texttt{28} and timeout
+state \texttt{-1} remain absorbing in every bin.
+
+\subsection{Prediction}
+
+Prediction uses true piecewise propagation. Starting from current journey age
+$t$ and current state $s$, the model advances the probability row vector across
+all bin boundaries crossed by the 60-day horizon:
+\[
+    p(t+h)
+    =
+    p(t)
+    \exp(Q_{b_1}\Delta t_1)
+    \exp(Q_{b_2}\Delta t_2)
+    \cdots
+    \exp(Q_{b_m}\Delta t_m).
+\]
+The returned score is the probability mass in \texttt{order\_shipped} after
+this propagation. This keeps the CTMC interpretation but lets rates vary with
+journey age.
+
+\section{New Model 3: Empirical Semi-Markov Timeout Model}
 
 \subsection{Motivation}
 
@@ -300,8 +362,8 @@ rate model.
 
 \section{Active Model Set}
 
-The active CTMC comparison now contains exactly two old CTMC methods and two
-timeout-aware methods:
+The active CTMC comparison contains the retained baselines plus several
+timeout-aware extensions:
 
 \begin{center}
 \begin{tabular}{lll}
@@ -311,14 +373,15 @@ Model & Target & Status \\
 \texttt{GlobalCTMC} & hit success within 60 days & retained old baseline \\
 \texttt{ClusteredCTMC} & hit success within 60 days & retained old baseline \\
 \texttt{TimeoutAbsorbingCTMC} & success before inactivity failure & new primary CTMC target \\
+\texttt{PiecewiseTimeVaryingTimeoutCTMC} & time-varying success before timeout & non-homogeneous CTMC target \\
 \texttt{SemiMarkovTimeoutModel} & success before inactivity failure & new non-exponential target \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 Older experimental CTMC variants such as neural-rate CTMC, XGBoost-rate CTMC,
-time-stratified CTMC, Laplace-smoothed CTMC, and isotonic CTMC calibration are
-not part of the active CTMC comparison.
+legacy time-stratified CTMC, Laplace-smoothed CTMC, and isotonic CTMC
+calibration are not part of the active CTMC comparison.
 
 \section{Commands}
 
@@ -331,6 +394,14 @@ Run only spectral clustered CTMC:
 \begin{flushleft}
 \texttt{python -m src.models.ctmc\_pipeline clustered}\\
 \texttt{\quad --use-spectral-clustering --no-cache}
+\end{flushleft}
+
+Run the piecewise time-varying timeout CTMC:
+\begin{flushleft}
+\texttt{python -m src.models.ctmc\_pipeline temporal}\\
+\texttt{\quad --test-events data/open\_journeys2.csv}\\
+\texttt{\quad --sample data/open\_journeys2\_flattened\_all0.csv}\\
+\texttt{\quad --output-dir results/submissions/open\_journeys2}
 \end{flushleft}
 
 \end{document}

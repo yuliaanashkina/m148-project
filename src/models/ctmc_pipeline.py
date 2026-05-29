@@ -11,6 +11,7 @@ python -m src.models.ctmc_pipeline all
 # Or separate phases:
 python -m src.models.ctmc_pipeline train    # fit + serialize models
 python -m src.models.ctmc_pipeline predict  # load cached models + write CSVs
+python -m src.models.ctmc_pipeline suite    # run all retained CTMC submission modes
 python -m src.models.ctmc_pipeline tune-k   # Optuna over k, then train + predict
 python -m src.models.ctmc_pipeline clustered --use-spectral-clustering
                                           # fit/predict only clustered CTMC
@@ -26,6 +27,7 @@ Common options
 --output-dir PATH     where to write submission CSVs    (default: results/submissions/)
 --test-events PATH    open_journeys1.csv from Kaggle    (default: data/open_journeys1.csv)
 --sample PATH         Kaggle all-zeros template CSV     (default: data/open_journeys1_flattened_all0.csv)
+--test-prevalence P   override prevalence calibration target
 --no-cache            always retrain even if models exist
 
 Model files
@@ -39,7 +41,15 @@ Model files
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+
+# Avoid Windows MKL/OpenMP hangs in sklearn KMeans/SpectralClustering. Users can
+# still override these before launch if they intentionally want more threads.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -64,14 +74,20 @@ def _import_ctmc():
     try:
         from .ctmc import (
             CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC,
-            SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC,
+            SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC, HigherOrderCTMC,
+            PiecewiseTimeVaryingTimeoutCTMC,
         )
     except ImportError:
         from ctmc import (
             CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC,
-            SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC,
+            SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC, HigherOrderCTMC,
+            PiecewiseTimeVaryingTimeoutCTMC,
         )
-    return CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC, SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC
+    return (
+        CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC,
+        SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC, HigherOrderCTMC,
+        PiecewiseTimeVaryingTimeoutCTMC,
+    )
 
 
 def _import_submission_helpers():
@@ -119,6 +135,51 @@ def best_optuna_params() -> dict:
     return params
 
 
+def _path_arg(value: str) -> Path:
+    """Parse CLI path arguments and reject empty PowerShell variables."""
+    if value is None or not str(value).strip():
+        raise argparse.ArgumentTypeError(
+            "path value is empty; set the PowerShell variable or pass a literal path"
+        )
+    return Path(value)
+
+
+def _target_prevalence(default_prevalence: float, test_prevalence: float | None) -> float:
+    """Resolve the prevalence target used for prior-probability calibration."""
+    return float(default_prevalence if test_prevalence is None else test_prevalence)
+
+
+def _calibrate_with_target(probs: np.ndarray, calibrate_prevalence, test_prevalence: float | None) -> np.ndarray:
+    """Apply existing calibration, optionally overriding the Kaggle test prevalence."""
+    if test_prevalence is None:
+        return calibrate_prevalence(probs)
+    return calibrate_prevalence(probs, test_prev=float(test_prevalence))
+
+
+def _brier_report_with_target(name: str, probs: np.ndarray, brier_report, test_prevalence: float | None) -> None:
+    """Print probability diagnostics against the active prevalence target."""
+    if test_prevalence is None:
+        brier_report(name, probs)
+    else:
+        brier_report(name, probs, test_prev=float(test_prevalence))
+
+
+def _cached_models_are_timeout_aware(models_dir: Path) -> bool:
+    """Return True only for the new two-absorbing-state cache format."""
+    try:
+        import joblib
+
+        _CTMCData, _GlobalCTMC, _ClusteredCTMC, TimeoutAbsorbingCTMC, *_ = _import_ctmc()
+        global_model = joblib.load(models_dir / "global_ctmc.joblib")
+        clustered_model = joblib.load(models_dir / "clustered_ctmc.joblib")
+    except Exception:
+        return False
+    return (
+        isinstance(global_model, TimeoutAbsorbingCTMC)
+        and bool(getattr(clustered_model, "timeout_absorbing", False))
+    )
+
+
 def train(
     n_clusters: int = 3,
     use_spectral_clustering: bool = False,
@@ -128,7 +189,7 @@ def train(
     """Fit GlobalCTMC, ClusteredCTMC, and timeout-aware models; serialize."""
     import joblib
 
-    CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC, SemiMarkovTimeoutModel, _ = _import_ctmc()
+    CTMCData, GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC, SemiMarkovTimeoutModel, *_ = _import_ctmc()
 
     print(f"Loading up to {max_journeys:,} training journeys...")
     data = CTMCData()
@@ -137,19 +198,19 @@ def train(
     print(f"  {len(transitions):,} transitions from {transitions['id'].nunique():,} journeys")
     print(f"  {len(timeout_transitions):,} timeout-aware transitions")
 
-    print("Fitting GlobalCTMC...")
-    global_ctmc = GlobalCTMC().fit(transitions)
+    print("Fitting global TimeoutAbsorbingCTMC...")
+    global_ctmc = TimeoutAbsorbingCTMC().fit(timeout_transitions)
 
     cluster_method = "spectral" if use_spectral_clustering else "kmeans"
-    print(f"Fitting ClusteredCTMC (method={cluster_method}, k={n_clusters})...")
+    print(f"Fitting timeout-aware ClusteredCTMC (method={cluster_method}, k={n_clusters})...")
     clustered = ClusteredCTMC(
         n_clusters=n_clusters,
         use_spectral_clustering=use_spectral_clustering,
-    ).fit(transitions)
+        timeout_absorbing=True,
+    ).fit(transitions, model_transitions=timeout_transitions)
     print(clustered.cluster_summary().to_string(index=False))
 
-    print("Fitting TimeoutAbsorbingCTMC...")
-    timeout_ctmc = TimeoutAbsorbingCTMC().fit(timeout_transitions)
+    timeout_ctmc = global_ctmc
 
     print("Fitting SemiMarkovTimeoutModel...")
     semi_markov = SemiMarkovTimeoutModel().fit(timeout_transitions)
@@ -172,11 +233,12 @@ def run_clustered_only(
     n_clusters: int = 3,
     use_spectral_clustering: bool = False,
     max_journeys: int | None = 100_000,
+    test_prevalence: float | None = None,
 ) -> pd.DataFrame:
-    """Fit GlobalCTMC + ClusteredCTMC and write only the clustered submission."""
+    """Fit global + clustered timeout-aware CTMCs and write one submission."""
     import joblib
 
-    CTMCData, GlobalCTMC, ClusteredCTMC, *_ = _import_ctmc()
+    CTMCData, _GlobalCTMC, ClusteredCTMC, TimeoutAbsorbingCTMC, *_ = _import_ctmc()
     (
         load_test_events, test_features_from_events,
         write_flattened_all0_template, write_submission,
@@ -187,16 +249,19 @@ def run_clustered_only(
     print(f"Loading up to {max_journeys:,} training journeys...")
     data = CTMCData()
     transitions = data.transition_table(max_journeys=max_journeys, customer_actions_only=True)
+    timeout_transitions = data.timeout_transition_table(max_journeys=max_journeys)
     print(f"  {len(transitions):,} transitions from {transitions['id'].nunique():,} journeys")
+    print(f"  {len(timeout_transitions):,} timeout-aware transitions")
 
-    print("Fitting GlobalCTMC fallback...")
-    global_ctmc = GlobalCTMC().fit(transitions)
+    print("Fitting global TimeoutAbsorbingCTMC fallback...")
+    global_ctmc = TimeoutAbsorbingCTMC().fit(timeout_transitions)
 
-    print(f"Fitting ClusteredCTMC only (method={method}, k={n_clusters})...")
+    print(f"Fitting timeout-aware ClusteredCTMC only (method={method}, k={n_clusters})...")
     clustered = ClusteredCTMC(
         n_clusters=n_clusters,
         use_spectral_clustering=use_spectral_clustering,
-    ).fit(transitions)
+        timeout_absorbing=True,
+    ).fit(transitions, model_transitions=timeout_transitions)
     print(clustered.cluster_summary().to_string(index=False))
 
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -218,15 +283,16 @@ def run_clustered_only(
         print(f"Created Kaggle ID template: {sample_path}")
 
     features = test_features_from_events(events, clustered.feature_builder)
-    print(f"Test prevalence target: {TEST_PREVALENCE:.4f}")
+    target_prev = _target_prevalence(TEST_PREVALENCE, test_prevalence)
+    print(f"Test prevalence target: {target_prev:.4f}")
     probs_raw = clustered.predict_success_probability(
         features,
         success_state=SUCCESS_STATE,
         horizon_seconds=HORIZON_SECONDS,
         fallback_model=global_ctmc,
     )
-    probs = calibrate_prevalence(probs_raw)
-    brier_report(f"{suffix}_clustered_ctmc", probs)
+    probs = _calibrate_with_target(probs_raw, calibrate_prevalence, test_prevalence)
+    _brier_report_with_target(f"{suffix}_clustered_ctmc", probs, brier_report, test_prevalence)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"ctmc_{suffix}_clustered_submission.csv"
@@ -240,6 +306,161 @@ def run_clustered_only(
     return output
 
 
+def run_temporal_ctmc(
+    test_events_path: Path = DEFAULT_TEST_EVENTS,
+    sample_path: Path = DEFAULT_SAMPLE,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
+    max_journeys: int | None = 100_000,
+    test_prevalence: float | None = None,
+) -> pd.DataFrame:
+    """Fit piecewise time-varying timeout CTMC and write one submission."""
+    import joblib
+
+    CTMCData, _GlobalCTMC, _ClusteredCTMC, _TimeoutAbsorbingCTMC, _SemiMarkovTimeoutModel, _SnapshotFeatureClusteredCTMC, _HigherOrderCTMC, PiecewiseTimeVaryingTimeoutCTMC = _import_ctmc()
+    (
+        load_test_events, _test_features_from_events,
+        write_flattened_all0_template, write_submission,
+        brier_report, calibrate_prevalence, TEST_PREVALENCE,
+    ) = _import_submission_helpers()
+
+    print(f"Loading up to {max_journeys:,} training journeys...")
+    data = CTMCData()
+    transitions = data.transition_table(max_journeys=max_journeys, customer_actions_only=True)
+    timeout_transitions = data.timeout_transition_table(max_journeys=max_journeys)
+    print(f"  {len(transitions):,} transitions from {transitions['id'].nunique():,} journeys")
+    print(f"  {len(timeout_transitions):,} timeout-aware transitions")
+
+    print("Fitting PiecewiseTimeVaryingTimeoutCTMC...")
+    temporal = PiecewiseTimeVaryingTimeoutCTMC().fit(
+        timeout_transitions,
+        feature_transitions=transitions,
+    )
+    print(temporal.bin_summary().to_string(index=False))
+
+    models_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(temporal, models_dir / "piecewise_time_varying_ctmc.joblib")
+
+    if not test_events_path.exists():
+        raise FileNotFoundError(
+            f"Test events file not found: {test_events_path}. "
+            "Add the open journey event CSV to generate submissions."
+        )
+
+    print(f"Loading test events from {test_events_path}...")
+    raw_events = load_test_events(test_events_path)
+    events = raw_events[
+        raw_events["ed_id"].isin(data.customer_action_states(include_success=True))
+    ].copy()
+    if not sample_path.exists():
+        write_flattened_all0_template(raw_events, sample_path)
+        print(f"Created Kaggle ID template: {sample_path}")
+
+    features = temporal.feature_builder.features_from_events(events)
+    target_prev = _target_prevalence(TEST_PREVALENCE, test_prevalence)
+    print(f"Test prevalence target: {target_prev:.4f}")
+    probs_raw = temporal.predict_success_probability(
+        features,
+        success_state=SUCCESS_STATE,
+        horizon_seconds=HORIZON_SECONDS,
+    )
+    probs = _calibrate_with_target(probs_raw, calibrate_prevalence, test_prevalence)
+    _brier_report_with_target("temporal_ctmc", probs, brier_report, test_prevalence)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "ctmc_temporal_submission.csv"
+    output = write_submission(
+        features["id"],
+        probs,
+        output_path,
+        sample_path=sample_path,
+    )
+    print(f"Wrote temporal CTMC submission: {output_path}")
+    return output
+
+
+def run_higher_order_ctmc(
+    test_events_path: Path = DEFAULT_TEST_EVENTS,
+    sample_path: Path = DEFAULT_SAMPLE,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
+    order: int = 2,
+    max_journeys: int | None = 100_000,
+    test_prevalence: float | None = None,
+) -> pd.DataFrame:
+    """Fit an order-k augmented-state CTMC and write one submission."""
+    import joblib
+
+    CTMCData, GlobalCTMC, _ClusteredCTMC, _TimeoutAbsorbingCTMC, _SemiMarkovTimeoutModel, _SnapshotFeatureClusteredCTMC, HigherOrderCTMC, _PiecewiseTimeVaryingTimeoutCTMC = _import_ctmc()
+    (
+        load_test_events, _test_features_from_events,
+        write_flattened_all0_template, write_submission,
+        brier_report, calibrate_prevalence, TEST_PREVALENCE,
+    ) = _import_submission_helpers()
+
+    data = CTMCData()
+    print(f"Loading up to {max_journeys:,} training journeys...")
+    train_events = data.events(
+        max_journeys=max_journeys,
+        customer_actions_only=True,
+        include_success=True,
+    )
+    print(f"  {len(train_events):,} customer-action events from {train_events['id'].nunique():,} journeys")
+
+    print("Fitting first-order GlobalCTMC fallback...")
+    transitions = data.transition_table(
+        max_journeys=max_journeys,
+        customer_actions_only=True,
+        include_success=True,
+    )
+    global_ctmc = GlobalCTMC().fit(transitions)
+
+    print(f"Fitting order-{order} augmented-state CTMC...")
+    higher_order = HigherOrderCTMC(order=order).fit_from_events(train_events)
+    print(f"  {len(higher_order.states_):,} augmented states")
+
+    models_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(higher_order, models_dir / f"higher_order_{order}_ctmc.joblib")
+
+    if not test_events_path.exists():
+        raise FileNotFoundError(
+            f"Test events file not found: {test_events_path}. "
+            "Add data/open_journeys1.csv to generate submissions."
+        )
+
+    print(f"Loading test events from {test_events_path}...")
+    raw_events = load_test_events(test_events_path)
+    state_set = data.customer_action_states(include_success=True)
+    events = raw_events[raw_events["ed_id"].isin(state_set)].copy()
+    if not sample_path.exists():
+        write_flattened_all0_template(raw_events, sample_path)
+        print(f"Created Kaggle ID template: {sample_path}")
+
+    histories = higher_order.histories_from_events(events)
+    target_prev = _target_prevalence(TEST_PREVALENCE, test_prevalence)
+    print(f"Test prevalence target: {target_prev:.4f}")
+    probs_raw = higher_order.absorption_probability(
+        histories["current_history"],
+        success_state=SUCCESS_STATE,
+        horizon_seconds=HORIZON_SECONDS,
+        fallback_states=histories["current_state"],
+        fallback_model=global_ctmc,
+    )
+    probs = _calibrate_with_target(probs_raw, calibrate_prevalence, test_prevalence)
+    _brier_report_with_target(f"higher_order_{order}_ctmc", probs, brier_report, test_prevalence)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"ctmc_higher_order_{order}_submission.csv"
+    output = write_submission(
+        histories["id"],
+        probs,
+        output_path,
+        sample_path=sample_path,
+    )
+    print(f"Wrote order-{order} CTMC submission: {output_path}")
+    return output
+
+
 def run_truncated_snapshot_ctmc(
     test_events_path: Path = DEFAULT_TEST_EVENTS,
     sample_path: Path = DEFAULT_SAMPLE,
@@ -248,11 +469,12 @@ def run_truncated_snapshot_ctmc(
     n_clusters: int = 3,
     use_spectral_clustering: bool = False,
     max_rows: int | None = 100_000,
+    test_prevalence: float | None = None,
 ) -> pd.DataFrame:
     """Fit CTMC using realistic truncated snapshots and suffix transitions."""
     import joblib
 
-    CTMCData, *_, SnapshotFeatureClusteredCTMC = _import_ctmc()
+    CTMCData, _GlobalCTMC, _ClusteredCTMC, _TimeoutAbsorbingCTMC, _SemiMarkovTimeoutModel, SnapshotFeatureClusteredCTMC, _HigherOrderCTMC, _PiecewiseTimeVaryingTimeoutCTMC = _import_ctmc()
     (
         _load_test_events, _test_features_from_events,
         write_flattened_all0_template, write_submission,
@@ -287,7 +509,7 @@ def run_truncated_snapshot_ctmc(
     print(model.cluster_summary().to_string(index=False))
 
     probs_raw = model.predict_success_probability(snapshots)
-    probs = calibrate_prevalence(probs_raw)
+    probs = _calibrate_with_target(probs_raw, calibrate_prevalence, test_prevalence)
     y = snapshots["label"].astype(int).to_numpy()
     probs_clip = np.clip(probs, 1e-6, 1 - 1e-6)
     metrics = pd.DataFrame([{
@@ -300,7 +522,7 @@ def run_truncated_snapshot_ctmc(
         "average_precision": average_precision_score(y, probs_clip),
         "mean_prob": float(np.mean(probs)),
     }])
-    brier_report(metrics.loc[0, "model"], probs)
+    _brier_report_with_target(metrics.loc[0, "model"], probs, brier_report, test_prevalence)
 
     models_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -314,20 +536,28 @@ def run_truncated_snapshot_ctmc(
         "order_shipped": probs,
     }).to_csv(output_dir / f"ctmc_truncated_snapshot_{suffix}_predictions.csv", index=False)
 
-    if data.open_realistic_features_path.exists():
-        print(f"Loading cached open journey features from {data.open_realistic_features_path}...")
-        open_features = data.load_open_realistic_features()
+    if test_events_path.resolve() == DEFAULT_TEST_EVENTS.resolve():
+        open_realistic_features_path = data.open_realistic_features_path
+    else:
+        open_realistic_features_path = (
+            data.open_realistic_features_path.parent
+            / f"{test_events_path.stem}_realistic_features.parquet"
+        )
+
+    if open_realistic_features_path.exists():
+        print(f"Loading cached open journey features from {open_realistic_features_path}...")
+        open_features = pl.read_parquet(open_realistic_features_path).to_pandas()
     else:
         if not test_events_path.exists():
             raise FileNotFoundError(
                 f"Test events file not found: {test_events_path}. "
-                "Add data/open_journeys1.csv to generate submissions."
+                "Add the open journey event CSV to generate submissions."
             )
         print(f"Building open journey features from {test_events_path}...")
         open_events = pl.read_csv(test_events_path)
         open_features_pl = build_open_journey_realistic_features(open_events)
-        data.open_realistic_features_path.parent.mkdir(parents=True, exist_ok=True)
-        open_features_pl.write_parquet(data.open_realistic_features_path)
+        open_realistic_features_path.parent.mkdir(parents=True, exist_ok=True)
+        open_features_pl.write_parquet(open_realistic_features_path)
         open_features = open_features_pl.to_pandas()
     print(f"  {len(open_features):,} open journey feature rows")
 
@@ -339,8 +569,8 @@ def run_truncated_snapshot_ctmc(
         print(f"Created Kaggle ID template: {sample_path}")
 
     open_probs_raw = model.predict_success_probability(open_features)
-    open_probs = calibrate_prevalence(open_probs_raw)
-    brier_report(f"truncated_snapshot_{suffix}_submission", open_probs)
+    open_probs = _calibrate_with_target(open_probs_raw, calibrate_prevalence, test_prevalence)
+    _brier_report_with_target(f"truncated_snapshot_{suffix}_submission", open_probs, brier_report, test_prevalence)
     submission = write_submission(
         open_features["id"],
         open_probs,
@@ -367,6 +597,7 @@ def predict(
     clustered=None,
     timeout_ctmc=None,
     semi_markov=None,
+    test_prevalence: float | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Load (or reuse) fitted models and write Kaggle submission CSVs."""
     import joblib
@@ -399,7 +630,8 @@ def predict(
     # not reset the 60-day inactivity clock.
     clustered_features = test_features_from_events(events, clustered.feature_builder)
 
-    print(f"Test prevalence target: {TEST_PREVALENCE:.4f}")
+    target_prev = _target_prevalence(TEST_PREVALENCE, test_prevalence)
+    print(f"Test prevalence target: {target_prev:.4f}")
 
     # Raw probabilities.
     global_probs_raw = global_ctmc.absorption_probability(
@@ -423,17 +655,17 @@ def predict(
         + semi_markov_probs_raw
     )
 
-    global_probs          = calibrate_prevalence(global_probs_raw)
-    clustered_probs       = calibrate_prevalence(clustered_probs_raw)
-    timeout_probs         = calibrate_prevalence(timeout_probs_raw)
-    semi_markov_probs     = calibrate_prevalence(semi_markov_probs_raw)
-    blended_probs         = calibrate_prevalence(blended_raw)
+    global_probs          = _calibrate_with_target(global_probs_raw, calibrate_prevalence, test_prevalence)
+    clustered_probs       = _calibrate_with_target(clustered_probs_raw, calibrate_prevalence, test_prevalence)
+    timeout_probs         = _calibrate_with_target(timeout_probs_raw, calibrate_prevalence, test_prevalence)
+    semi_markov_probs     = _calibrate_with_target(semi_markov_probs_raw, calibrate_prevalence, test_prevalence)
+    blended_probs         = _calibrate_with_target(blended_raw, calibrate_prevalence, test_prevalence)
 
-    brier_report("global_ctmc",             global_probs)
-    brier_report("clustered_ctmc",          clustered_probs)
-    brier_report("timeout_absorbing_ctmc",  timeout_probs)
-    brier_report("semi_markov_timeout",     semi_markov_probs)
-    brier_report("blend_ctmc",              blended_probs)
+    _brier_report_with_target("global_ctmc",             global_probs,      brier_report, test_prevalence)
+    _brier_report_with_target("clustered_ctmc",          clustered_probs,   brier_report, test_prevalence)
+    _brier_report_with_target("timeout_absorbing_ctmc",  timeout_probs,     brier_report, test_prevalence)
+    _brier_report_with_target("semi_markov_timeout",     semi_markov_probs, brier_report, test_prevalence)
+    _brier_report_with_target("blend_ctmc",              blended_probs,     brier_report, test_prevalence)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = {
@@ -504,6 +736,88 @@ def tune_k(
     return best_k
 
 
+def run_suite(
+    test_events_path: Path = DEFAULT_TEST_EVENTS,
+    sample_path: Path = DEFAULT_SAMPLE,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
+    n_clusters: int = 3,
+    max_journeys: int | None = 100_000,
+    test_prevalence: float | None = None,
+) -> dict[str, object]:
+    """Run the retained CTMC submission suite for one open-journey file."""
+    print("\n=== CTMC suite: global, KMeans clustered, timeout, semi-Markov, blend ===")
+    global_ctmc, clustered, timeout_ctmc, semi_markov = train(
+        n_clusters=n_clusters,
+        use_spectral_clustering=False,
+        max_journeys=max_journeys,
+        models_dir=models_dir,
+    )
+    outputs: dict[str, object] = {
+        "base": predict(
+            test_events_path=test_events_path,
+            sample_path=sample_path,
+            output_dir=output_dir,
+            models_dir=models_dir,
+            global_ctmc=global_ctmc,
+            clustered=clustered,
+            timeout_ctmc=timeout_ctmc,
+            semi_markov=semi_markov,
+            test_prevalence=test_prevalence,
+        )
+    }
+
+    print("\n=== CTMC suite: spectral clustered ===")
+    outputs["spectral_clustered"] = run_clustered_only(
+        test_events_path=test_events_path,
+        sample_path=sample_path,
+        output_dir=output_dir,
+        models_dir=models_dir,
+        n_clusters=n_clusters,
+        use_spectral_clustering=True,
+        max_journeys=max_journeys,
+        test_prevalence=test_prevalence,
+    )
+
+    print("\n=== CTMC suite: piecewise time-varying timeout ===")
+    outputs["temporal"] = run_temporal_ctmc(
+        test_events_path=test_events_path,
+        sample_path=sample_path,
+        output_dir=output_dir,
+        models_dir=models_dir,
+        max_journeys=max_journeys,
+        test_prevalence=test_prevalence,
+    )
+
+    for order in (2, 3):
+        print(f"\n=== CTMC suite: higher-order order={order} ===")
+        outputs[f"higher_order_{order}"] = run_higher_order_ctmc(
+            test_events_path=test_events_path,
+            sample_path=sample_path,
+            output_dir=output_dir,
+            models_dir=models_dir,
+            order=order,
+            max_journeys=max_journeys,
+            test_prevalence=test_prevalence,
+        )
+
+    for use_spectral in (False, True):
+        method = "spectral" if use_spectral else "kmeans"
+        print(f"\n=== CTMC suite: truncated snapshot {method} ===")
+        outputs[f"truncated_{method}"] = run_truncated_snapshot_ctmc(
+            test_events_path=test_events_path,
+            sample_path=sample_path,
+            output_dir=output_dir,
+            models_dir=models_dir,
+            n_clusters=n_clusters,
+            use_spectral_clustering=use_spectral,
+            max_rows=max_journeys,
+            test_prevalence=test_prevalence,
+        )
+
+    return outputs
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -515,18 +829,28 @@ def main() -> None:
     )
     parser.add_argument(
         "mode",
-        choices=["train", "predict", "all", "tune-k", "clustered", "truncated"],
+        choices=["train", "predict", "all", "suite", "tune-k", "clustered", "truncated", "higher-order", "temporal"],
         help=(
             "train: fit and save models; "
             "predict: load models and write CSVs; "
             "all: train then predict; "
+            "suite: run all retained CTMC submission modes; "
             "tune-k: Optuna search for best k, then all; "
             "clustered: fit/predict only GlobalCTMC + ClusteredCTMC; "
-            "truncated: fit CTMC from realistic truncated snapshots"
+            "truncated: fit CTMC from realistic truncated snapshots; "
+            "higher-order: fit an order-k augmented-state CTMC; "
+            "temporal: fit a piecewise time-varying timeout CTMC"
         ),
     )
     parser.add_argument("--max-journeys",    type=int,   default=100_000)
     parser.add_argument("--n-clusters",      type=int,   default=3)
+    parser.add_argument(
+        "--markov-order",
+        type=int,
+        default=2,
+        choices=[2, 3],
+        help="History length for higher-order augmented-state CTMC.",
+    )
     parser.add_argument(
         "--use-spectral-clustering",
         action="store_true",
@@ -535,10 +859,39 @@ def main() -> None:
     parser.add_argument("--n-tune-trials",   type=int,   default=20)
     parser.add_argument("--k-min",           type=int,   default=2)
     parser.add_argument("--k-max",           type=int,   default=12)
-    parser.add_argument("--models-dir",      type=Path,  default=DEFAULT_MODELS_DIR)
-    parser.add_argument("--output-dir",      type=Path,  default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--test-events",     type=Path,  default=DEFAULT_TEST_EVENTS)
-    parser.add_argument("--sample",          type=Path,  default=DEFAULT_SAMPLE)
+    parser.add_argument(
+        "--models-dir",
+        type=_path_arg,
+        default=DEFAULT_MODELS_DIR,
+        help="Directory for cached .joblib models.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=_path_arg,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for output CSVs.",
+    )
+    parser.add_argument(
+        "--test-events",
+        type=_path_arg,
+        default=DEFAULT_TEST_EVENTS,
+        help="Open journey event CSV.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=_path_arg,
+        default=DEFAULT_SAMPLE,
+        help="Kaggle sample/template CSV.",
+    )
+    parser.add_argument(
+        "--test-prevalence",
+        type=float,
+        default=None,
+        help=(
+            "Override the prevalence target used for prior-probability calibration. "
+            "For open_journeys2, all-zero Brier 0.04180 implies --test-prevalence 0.04180."
+        ),
+    )
     parser.add_argument(
         "--no-cache",
         action="store_true",
@@ -550,6 +903,14 @@ def main() -> None:
         help="Read best n_clusters from Optuna trial CSVs in results/",
     )
     args = parser.parse_args()
+
+    print("Resolved CTMC pipeline paths:")
+    print(f"  test_events: {args.test_events}")
+    print(f"  sample:      {args.sample}")
+    print(f"  output_dir:  {args.output_dir}")
+    print(f"  models_dir:  {args.models_dir}")
+    if args.test_prevalence is not None:
+        print(f"  test_prev:   {args.test_prevalence:.5f}")
 
     n_clusters = args.n_clusters
 
@@ -574,6 +935,7 @@ def main() -> None:
             n_clusters=n_clusters,
             use_spectral_clustering=args.use_spectral_clustering,
             max_journeys=args.max_journeys,
+            test_prevalence=args.test_prevalence,
         )
         return
 
@@ -586,6 +948,42 @@ def main() -> None:
             n_clusters=n_clusters,
             use_spectral_clustering=args.use_spectral_clustering,
             max_rows=args.max_journeys,
+            test_prevalence=args.test_prevalence,
+        )
+        return
+
+    if args.mode == "higher-order":
+        run_higher_order_ctmc(
+            test_events_path=args.test_events,
+            sample_path=args.sample,
+            output_dir=args.output_dir,
+            models_dir=args.models_dir,
+            order=args.markov_order,
+            max_journeys=args.max_journeys,
+            test_prevalence=args.test_prevalence,
+        )
+        return
+
+    if args.mode == "temporal":
+        run_temporal_ctmc(
+            test_events_path=args.test_events,
+            sample_path=args.sample,
+            output_dir=args.output_dir,
+            models_dir=args.models_dir,
+            max_journeys=args.max_journeys,
+            test_prevalence=args.test_prevalence,
+        )
+        return
+
+    if args.mode == "suite":
+        run_suite(
+            test_events_path=args.test_events,
+            sample_path=args.sample,
+            output_dir=args.output_dir,
+            models_dir=args.models_dir,
+            n_clusters=n_clusters,
+            max_journeys=args.max_journeys,
+            test_prevalence=args.test_prevalence,
         )
         return
 
@@ -606,6 +1004,7 @@ def main() -> None:
         and (args.models_dir / "clustered_ctmc.joblib").exists()
         and (args.models_dir / "timeout_absorbing_ctmc.joblib").exists()
         and (args.models_dir / "semi_markov_timeout.joblib").exists()
+        and _cached_models_are_timeout_aware(args.models_dir)
     )
 
     if args.mode in ("train", "all"):
@@ -641,6 +1040,7 @@ def main() -> None:
             clustered=clustered,
             timeout_ctmc=timeout_ctmc,
             semi_markov=semi_markov,
+            test_prevalence=args.test_prevalence,
         )
 
 

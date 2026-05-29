@@ -15,9 +15,18 @@ The code uses the checkpointed parquet files produced by the data engineering wo
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+# Windows + MKL/OpenMP can hang on tiny KMeans jobs when many worker threads are
+# spawned. Keep sklearn clustering deterministic and boring unless the caller
+# explicitly overrides these environment variables before import.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -602,6 +611,204 @@ class GlobalCTMC:
             raise RuntimeError("Call fit() before reading CTMC outputs.")
 
 
+class HigherOrderCTMC:
+    """Augmented-state CTMC using the last k customer actions as state.
+
+    A second-order model uses states like (previous_action, current_action).
+    A third-order model uses (two_back, previous_action, current_action).
+    This keeps the CTMC rate-estimation machinery but lets the current state
+    carry short action-history memory.
+    """
+
+    def __init__(
+        self,
+        order: int = 2,
+        success_state: int = SUCCESS_STATE,
+        start_state: int = -999,
+        min_time: float = 1e-9,
+    ) -> None:
+        if order < 2:
+            raise ValueError("HigherOrderCTMC requires order >= 2.")
+        self.order = int(order)
+        self.success_state = int(success_state)
+        self.start_state = int(start_state)
+        self.min_time = float(min_time)
+        self.success_aug_state_: tuple[int, ...] = tuple([self.success_state] * self.order)
+        self.states_: list[tuple[int, ...]] = []
+        self.state_to_idx_: dict[tuple[int, ...], int] = {}
+        self.Q_: np.ndarray | None = None
+        self.transition_counts_: pd.DataFrame | None = None
+        self.time_in_state_: pd.Series | None = None
+
+    def fit_from_events(self, events: pd.DataFrame) -> "HigherOrderCTMC":
+        """Fit from sorted event rows with columns id, event_timestamp, ed_id."""
+        required = {"id", "event_timestamp", "ed_id"}
+        missing = required - set(events.columns)
+        if missing:
+            raise ValueError(f"events missing required columns: {sorted(missing)}")
+
+        df = events[["id", "event_timestamp", "ed_id"]].copy()
+        df["event_timestamp"] = pd.to_datetime(df["event_timestamp"], utc=True)
+        df["ed_id"] = df["ed_id"].astype(int)
+        df = df.sort_values(["id", "event_timestamp", "ed_id"])
+
+        counts: dict[tuple[tuple[int, ...], tuple[int, ...]], int] = {}
+        time_in_state: dict[tuple[int, ...], float] = {}
+        states: set[tuple[int, ...]] = {self.success_aug_state_}
+
+        for _, group in df.groupby("id", sort=False):
+            action_ids = group["ed_id"].astype(int).to_list()
+            times = group["event_timestamp"].to_list()
+            if len(action_ids) < 2:
+                continue
+
+            for m in range(len(action_ids) - 1):
+                current_history = self._history_from_prefix(action_ids[: m + 1])
+                next_action = int(action_ids[m + 1])
+                next_history = (
+                    self.success_aug_state_
+                    if next_action == self.success_state
+                    else self._history_from_prefix(action_ids[: m + 2])
+                )
+                if current_history == next_history:
+                    continue
+
+                dt = max((times[m + 1] - times[m]).total_seconds(), 0.0)
+                states.add(current_history)
+                states.add(next_history)
+                counts[(current_history, next_history)] = (
+                    counts.get((current_history, next_history), 0) + 1
+                )
+                time_in_state[current_history] = time_in_state.get(current_history, 0.0) + dt
+
+        self.states_ = sorted(states, key=lambda x: tuple(x))
+        self.state_to_idx_ = {state: idx for idx, state in enumerate(self.states_)}
+        n_states = len(self.states_)
+        q = np.zeros((n_states, n_states), dtype=float)
+
+        for (from_state, to_state), count in counts.items():
+            i = self.state_to_idx_[from_state]
+            j = self.state_to_idx_[to_state]
+            exposure = max(time_in_state.get(from_state, 0.0), self.min_time)
+            q[i, j] = count / exposure
+
+        np.fill_diagonal(q, 0.0)
+        q[np.diag_indices_from(q)] = -q.sum(axis=1)
+        success_idx = self.state_to_idx_.get(self.success_aug_state_)
+        if success_idx is not None:
+            q[success_idx, :] = 0.0
+
+        self.Q_ = q
+        self.transition_counts_ = self._counts_frame(counts)
+        self.time_in_state_ = pd.Series(time_in_state, dtype=float).reindex(
+            self.states_, fill_value=0.0
+        )
+        return self
+
+    def absorption_probability(
+        self,
+        histories: Iterable[Iterable[int] | tuple[int, ...]],
+        success_state: int = SUCCESS_STATE,
+        horizon_seconds: float = TIMEOUT_SECONDS,
+        fallback_states: Iterable[int] | None = None,
+        fallback_model: GlobalCTMC | None = None,
+    ) -> np.ndarray:
+        """Estimate P(hit success within horizon | current action history)."""
+        self._check_fit()
+        histories_list = list(histories)
+
+        fallback_probs: np.ndarray
+        if fallback_model is not None and fallback_states is not None:
+            fallback_probs = fallback_model.absorption_probability(
+                fallback_states,
+                success_state=success_state,
+                horizon_seconds=horizon_seconds,
+            )
+        else:
+            fallback_probs = np.full(len(histories_list), self._empirical_success_prior())
+
+        if self.success_aug_state_ not in self.state_to_idx_:
+            return np.clip(fallback_probs, 0.0, 1.0)
+
+        try:
+            from scipy.linalg import expm
+        except ImportError as exc:
+            raise ImportError("scipy is required for higher-order CTMC predictions") from exc
+
+        p = expm(self.Q_ * horizon_seconds)
+        success_idx = self.state_to_idx_[self.success_aug_state_]
+
+        probs = []
+        for idx, history in enumerate(histories_list):
+            state = self._history_from_prefix(list(history))
+            state_idx = self.state_to_idx_.get(state)
+            probs.append(
+                float(fallback_probs[idx])
+                if state_idx is None
+                else float(p[state_idx, success_idx])
+            )
+        return np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
+
+    def histories_from_events(self, events: pd.DataFrame) -> pd.DataFrame:
+        """Return one current augmented history per open journey."""
+        required = {"id", "event_timestamp", "ed_id"}
+        missing = required - set(events.columns)
+        if missing:
+            raise ValueError(f"events missing required columns: {sorted(missing)}")
+
+        df = events[["id", "event_timestamp", "ed_id"]].copy()
+        df["event_timestamp"] = pd.to_datetime(df["event_timestamp"], utc=True)
+        df["ed_id"] = df["ed_id"].astype(int)
+        df = df.sort_values(["id", "event_timestamp", "ed_id"])
+
+        rows = []
+        for journey_id, group in df.groupby("id", sort=False):
+            actions = group["ed_id"].astype(int).to_list()
+            if not actions:
+                continue
+            history = self._history_from_prefix(actions)
+            rows.append(
+                {
+                    "id": journey_id,
+                    "current_state": int(actions[-1]),
+                    "current_history": history,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def _history_from_prefix(self, actions: list[int]) -> tuple[int, ...]:
+        clean = [int(a) for a in actions]
+        if clean and clean[-1] == self.success_state:
+            return self.success_aug_state_
+        padded = [self.start_state] * max(0, self.order - len(clean)) + clean
+        return tuple(padded[-self.order :])
+
+    def _empirical_success_prior(self) -> float:
+        if self.transition_counts_ is None or self.transition_counts_.empty:
+            return 0.0
+        success_col = repr(self.success_aug_state_)
+        if success_col not in self.transition_counts_.columns:
+            return 0.0
+        total = float(self.transition_counts_.to_numpy().sum())
+        if total <= 0:
+            return 0.0
+        return float(self.transition_counts_[success_col].sum() / total)
+
+    def _counts_frame(
+        self,
+        counts: dict[tuple[tuple[int, ...], tuple[int, ...]], int],
+    ) -> pd.DataFrame:
+        labels = [repr(state) for state in self.states_]
+        frame = pd.DataFrame(0, index=labels, columns=labels, dtype=int)
+        for (from_state, to_state), count in counts.items():
+            frame.loc[repr(from_state), repr(to_state)] = int(count)
+        return frame
+
+    def _check_fit(self) -> None:
+        if self.Q_ is None:
+            raise RuntimeError("Call fit_from_events() before reading CTMC outputs.")
+
+
 class TimeoutAbsorbingCTMC(GlobalCTMC):
     """CTMC for P(success before 60-day inactivity failure).
 
@@ -624,6 +831,9 @@ class TimeoutAbsorbingCTMC(GlobalCTMC):
         self.fallback_: float = 0.0
 
     def fit(self, transitions: pd.DataFrame) -> "TimeoutAbsorbingCTMC":
+        transitions = transitions[
+            ~transitions["state"].astype(int).isin({self.success_state, self.failure_state})
+        ].copy()
         super().fit(transitions)
         self._fit_absorption_probabilities()
         return self
@@ -951,12 +1161,16 @@ class JourneyFeatureBuilder:
 
 
 class ClusteredCTMC:
-    """Cluster journeys, then fit one GlobalCTMC generator per cluster.
+    """Cluster journeys, then fit one CTMC generator per cluster.
 
     Set use_spectral_clustering=True to replace the original KMeans segmenter
     with nearest-neighbor spectral clustering. SpectralClustering has no
     predict() method, so fitting also trains a KNN assignment model in the same
     preprocessed feature space for future/open journeys.
+
+    When timeout_absorbing=True, clusters are still learned from ordinary
+    customer-action transitions, but the per-cluster generators are fit on
+    timeout-augmented transitions with absorbing success and inactivity states.
     """
 
     def __init__(
@@ -965,6 +1179,7 @@ class ClusteredCTMC:
         random_state: int = 42,
         use_spectral_clustering: bool = False,
         cluster_feature_mode: str = "auto",
+        timeout_absorbing: bool = False,
         spectral_n_neighbors: int = 20,
         spectral_assign_neighbors: int = 25,
         spectral_max_fit_rows: int = 25_000,
@@ -973,6 +1188,7 @@ class ClusteredCTMC:
         self.random_state = random_state
         self.use_spectral_clustering = use_spectral_clustering
         self.cluster_feature_mode = cluster_feature_mode
+        self.timeout_absorbing = timeout_absorbing
         self.spectral_n_neighbors = spectral_n_neighbors
         self.spectral_assign_neighbors = spectral_assign_neighbors
         self.spectral_max_fit_rows = spectral_max_fit_rows
@@ -985,7 +1201,11 @@ class ClusteredCTMC:
         self.feature_columns_: list[str] = []
         self.cluster_columns_: list[str] = []
 
-    def fit(self, transitions: pd.DataFrame) -> "ClusteredCTMC":
+    def fit(
+        self,
+        transitions: pd.DataFrame,
+        model_transitions: pd.DataFrame | None = None,
+    ) -> "ClusteredCTMC":
         from sklearn.cluster import KMeans, SpectralClustering
         from sklearn.impute import SimpleImputer
         from sklearn.neighbors import KNeighborsClassifier, kneighbors_graph
@@ -1060,9 +1280,11 @@ class ClusteredCTMC:
         assignments["cluster"] = clusters
         self.assignments_ = assignments
 
-        clustered_transitions = transitions.merge(assignments, on="id", how="inner")
+        transitions_for_models = model_transitions if model_transitions is not None else transitions
+        clustered_transitions = transitions_for_models.merge(assignments, on="id", how="inner")
+        model_cls = TimeoutAbsorbingCTMC if self.timeout_absorbing else GlobalCTMC
         for cluster_id, g in clustered_transitions.groupby("cluster"):
-            self.models_[int(cluster_id)] = GlobalCTMC().fit(g)
+            self.models_[int(cluster_id)] = model_cls().fit(g)
         return self
 
     def _select_cluster_columns(self, x: pd.DataFrame) -> list[str]:
@@ -1134,11 +1356,15 @@ class ClusteredCTMC:
             model = self.models_.get(int(cluster_id), fallback_model)
             if model is None:
                 continue
-            probs[mask] = model.absorption_probability(
-                features.loc[mask, "current_state"],
-                success_state=success_state,
-                horizon_seconds=horizon_seconds,
-            )
+            current_states = features.loc[mask, "current_state"]
+            if isinstance(model, TimeoutAbsorbingCTMC):
+                probs[mask] = model.predict_success_probability(current_states)
+            else:
+                probs[mask] = model.absorption_probability(
+                    current_states,
+                    success_state=success_state,
+                    horizon_seconds=horizon_seconds,
+                )
         return np.clip(probs, 0.0, 1.0)
 
     def predict_expected_hitting_time(
@@ -1609,6 +1835,300 @@ class TimeStratifiedCTMC:
                 "n_states": len(model.states_) if model else 0,
             })
         return pd.DataFrame(rows)
+
+
+class PiecewiseTimeVaryingTimeoutCTMC:
+    """Piecewise-constant non-homogeneous timeout-aware CTMC.
+
+    The model estimates one generator matrix Q_b per journey-age bin. Exposure
+    time is split across bins, while an observed jump i -> j is counted in the
+    bin where the jump occurs. Prediction propagates a probability row vector
+    through every crossed bin using matrix exponentials.
+    """
+
+    def __init__(
+        self,
+        bin_edges_seconds: tuple[float, ...] = (
+            86_400.0,        # 1 day
+            604_800.0,       # 7 days
+            2_592_000.0,     # 30 days
+            5_184_000.0,     # 60 days
+        ),
+        success_state: int = SUCCESS_STATE,
+        failure_state: int = FAILURE_STATE,
+        min_state_transitions: int = 20,
+        min_exposure_seconds: float = 3_600.0,
+        min_time: float = 1e-9,
+    ) -> None:
+        self.bin_edges_seconds = tuple(sorted(float(x) for x in bin_edges_seconds))
+        self.success_state = int(success_state)
+        self.failure_state = int(failure_state)
+        self.min_state_transitions = int(min_state_transitions)
+        self.min_exposure_seconds = float(min_exposure_seconds)
+        self.min_time = float(min_time)
+
+        self.feature_builder = JourneyFeatureBuilder()
+        self.n_bins_: int = len(self.bin_edges_seconds) + 1
+        self.states_: list[int] = []
+        self.state_to_idx_: dict[int, int] = {}
+        self.Q_by_bin_: dict[int, pd.DataFrame] = {}
+        self.counts_by_bin_: dict[int, pd.DataFrame] = {}
+        self.exposure_by_bin_: dict[int, pd.Series] = {}
+        self.row_fallback_by_bin_: dict[int, pd.Series] = {}
+        self.global_Q_: pd.DataFrame | None = None
+        self._eigendecomp_by_bin_: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray] | None] = {}
+        self.fallback_: float = 0.0
+
+    def _to_bin(self, seconds: np.ndarray | pd.Series | list[float]) -> np.ndarray:
+        return np.digitize(np.asarray(seconds, dtype=float), self.bin_edges_seconds, right=False)
+
+    def fit(
+        self,
+        transitions: pd.DataFrame,
+        feature_transitions: pd.DataFrame | None = None,
+    ) -> "PiecewiseTimeVaryingTimeoutCTMC":
+        """Fit bin-specific Q matrices from timeout-aware transitions."""
+        df = transitions.copy()
+        df = df[df["state"] != df["next_state"]].copy()
+        df["state"] = df["state"].astype(int)
+        df["next_state"] = df["next_state"].astype(int)
+        df["dt_seconds"] = pd.to_numeric(df["dt_seconds"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df = df[~df["state"].isin({self.success_state, self.failure_state})].copy()
+        df["_row_order"] = np.arange(len(df))
+        df = df.sort_values(["id", "_row_order"])
+
+        if feature_transitions is not None:
+            self.feature_builder.fit_transform(feature_transitions)
+        else:
+            self.feature_builder.fit_transform(df.drop(columns=["_row_order"]))
+
+        states = sorted(
+            set(df["state"].astype(int))
+            .union(set(df["next_state"].astype(int)))
+            .union({self.success_state, self.failure_state})
+        )
+        self.states_ = states
+        self.state_to_idx_ = {state: idx for idx, state in enumerate(states)}
+
+        n_states = len(states)
+        counts = np.zeros((self.n_bins_, n_states, n_states), dtype=float)
+        exposure = np.zeros((self.n_bins_, n_states), dtype=float)
+
+        for _, group in df.groupby("id", sort=False):
+            elapsed = 0.0
+            for row in group.itertuples(index=False):
+                state = int(row.state)
+                next_state = int(row.next_state)
+                dt = float(row.dt_seconds)
+                start = elapsed
+                end = elapsed + dt
+
+                state_idx = self.state_to_idx_[state]
+                for bin_idx, overlap in self._interval_bin_overlaps(start, end):
+                    exposure[bin_idx, state_idx] += overlap
+
+                jump_bin = int(self._to_bin([end])[0])
+                jump_bin = min(max(jump_bin, 0), self.n_bins_ - 1)
+                if next_state in self.state_to_idx_:
+                    next_idx = self.state_to_idx_[next_state]
+                    counts[jump_bin, state_idx, next_idx] += 1.0
+
+                elapsed = end
+
+        global_counts = counts.sum(axis=0)
+        global_exposure = exposure.sum(axis=0)
+        global_q = self._estimate_q_from_counts(global_counts, global_exposure)
+        self.global_Q_ = pd.DataFrame(global_q, index=states, columns=states)
+
+        success_idx = self.state_to_idx_[self.success_state]
+        failure_idx = self.state_to_idx_[self.failure_state]
+
+        for bin_idx in range(self.n_bins_):
+            q = np.zeros((n_states, n_states), dtype=float)
+            fallback_mask = np.zeros(n_states, dtype=bool)
+            outgoing_counts = counts[bin_idx].sum(axis=1)
+
+            for state, state_idx in self.state_to_idx_.items():
+                if state in {self.success_state, self.failure_state}:
+                    continue
+
+                enough_data = (
+                    exposure[bin_idx, state_idx] >= self.min_exposure_seconds
+                    and outgoing_counts[state_idx] >= self.min_state_transitions
+                )
+                if enough_data:
+                    row_q = counts[bin_idx, state_idx] / max(exposure[bin_idx, state_idx], self.min_time)
+                    row_q[state_idx] = 0.0
+                    row_q[state_idx] = -row_q.sum()
+                    q[state_idx] = row_q
+                else:
+                    q[state_idx] = global_q[state_idx]
+                    fallback_mask[state_idx] = True
+
+            q[success_idx, :] = 0.0
+            q[failure_idx, :] = 0.0
+
+            self.Q_by_bin_[bin_idx] = pd.DataFrame(q, index=states, columns=states)
+            self.counts_by_bin_[bin_idx] = pd.DataFrame(counts[bin_idx], index=states, columns=states)
+            self.exposure_by_bin_[bin_idx] = pd.Series(exposure[bin_idx], index=states)
+            self.row_fallback_by_bin_[bin_idx] = pd.Series(fallback_mask, index=states)
+
+        self._fit_eigendecompositions()
+
+        terminal_counts = global_counts[:, success_idx].sum() + global_counts[:, failure_idx].sum()
+        self.fallback_ = (
+            float(global_counts[:, success_idx].sum() / terminal_counts)
+            if terminal_counts > 0 else 0.0
+        )
+        return self
+
+    def predict_success_probability(
+        self,
+        features: pd.DataFrame,
+        success_state: int = SUCCESS_STATE,
+        horizon_seconds: float = TIMEOUT_SECONDS,
+    ) -> np.ndarray:
+        """Predict P(order_shipped by horizon) under piecewise Q(t)."""
+        self._check_fit()
+        if success_state != self.success_state:
+            raise ValueError("PiecewiseTimeVaryingTimeoutCTMC only supports its fitted success_state.")
+
+        if "current_state" not in features.columns or "total_observed_time" not in features.columns:
+            raise ValueError("features must contain current_state and total_observed_time")
+
+        if not self._eigendecomp_by_bin_:
+            self._fit_eigendecompositions()
+
+        success_idx = self.state_to_idx_.get(self.success_state)
+        if success_idx is None:
+            return np.zeros(len(features), dtype=float)
+
+        probs = np.zeros(len(features), dtype=float)
+        current_states = features["current_state"].to_numpy(dtype=int)
+        current_ages = features["total_observed_time"].to_numpy(dtype=float)
+
+        for row_idx, (state, age_seconds) in enumerate(zip(current_states, current_ages)):
+            state_idx = self.state_to_idx_.get(int(state))
+            if state_idx is None:
+                probs[row_idx] = self.fallback_
+                continue
+
+            p = np.zeros(len(self.states_), dtype=float)
+            p[state_idx] = 1.0
+            t = max(float(age_seconds), 0.0)
+            remaining = float(horizon_seconds)
+
+            while remaining > 1e-9:
+                bin_idx = min(int(self._to_bin([t])[0]), self.n_bins_ - 1)
+                next_boundary = (
+                    self.bin_edges_seconds[bin_idx]
+                    if bin_idx < len(self.bin_edges_seconds)
+                    else np.inf
+                )
+                if np.isfinite(next_boundary):
+                    segment = min(remaining, max(next_boundary - t, 0.0))
+                    if segment <= 1e-9:
+                        # Move exactly-on-boundary predictions into the next bin.
+                        t = next_boundary + 1e-6
+                        continue
+                else:
+                    segment = remaining
+
+                p = self._propagate_row(p, bin_idx, segment)
+                t += segment
+                remaining -= segment
+
+            probs[row_idx] = p[success_idx]
+
+        return np.clip(probs, 0.0, 1.0)
+
+    def bin_summary(self) -> pd.DataFrame:
+        self._check_fit()
+        rows = []
+        for bin_idx in range(self.n_bins_):
+            lower, upper = self._bin_bounds(bin_idx)
+            if np.isinf(upper):
+                window = f"{lower / 86400:.0f}d+"
+            elif lower == 0:
+                window = f"0-{upper / 86400:.0f}d"
+            else:
+                window = f"{lower / 86400:.0f}-{upper / 86400:.0f}d"
+
+            counts = self.counts_by_bin_[bin_idx]
+            exposure = self.exposure_by_bin_[bin_idx]
+            fallback = self.row_fallback_by_bin_[bin_idx]
+            rows.append({
+                "bin": bin_idx,
+                "window": window,
+                "n_transitions": int(counts.to_numpy().sum()),
+                "exposure_days": float(exposure.sum() / 86400),
+                "n_fallback_rows": int(fallback.sum()),
+                "n_states": len(self.states_),
+            })
+        return pd.DataFrame(rows)
+
+    def _interval_bin_overlaps(self, start: float, end: float):
+        if end <= start:
+            return
+        for bin_idx in range(self.n_bins_):
+            lower, upper = self._bin_bounds(bin_idx)
+            overlap_start = max(start, lower)
+            overlap_end = min(end, upper)
+            if overlap_end > overlap_start:
+                yield bin_idx, overlap_end - overlap_start
+            if end <= upper:
+                break
+
+    def _bin_bounds(self, bin_idx: int) -> tuple[float, float]:
+        lower = 0.0 if bin_idx == 0 else self.bin_edges_seconds[bin_idx - 1]
+        upper = (
+            self.bin_edges_seconds[bin_idx]
+            if bin_idx < len(self.bin_edges_seconds)
+            else np.inf
+        )
+        return lower, upper
+
+    def _estimate_q_from_counts(self, counts: np.ndarray, exposure: np.ndarray) -> np.ndarray:
+        n_states = len(self.states_)
+        q = np.zeros((n_states, n_states), dtype=float)
+        for state, state_idx in self.state_to_idx_.items():
+            if state in {self.success_state, self.failure_state}:
+                continue
+            if exposure[state_idx] <= 0:
+                continue
+            row_q = counts[state_idx] / max(float(exposure[state_idx]), self.min_time)
+            row_q[state_idx] = 0.0
+            row_q[state_idx] = -row_q.sum()
+            q[state_idx] = row_q
+        return q
+
+    def _fit_eigendecompositions(self) -> None:
+        self._eigendecomp_by_bin_ = {}
+        for bin_idx, q_df in self.Q_by_bin_.items():
+            q = q_df.to_numpy(dtype=float)
+            try:
+                eigvals, eigvecs = np.linalg.eig(q)
+                inv_eigvecs = np.linalg.inv(eigvecs)
+                self._eigendecomp_by_bin_[bin_idx] = (eigvals, eigvecs, inv_eigvecs)
+            except np.linalg.LinAlgError:
+                self._eigendecomp_by_bin_[bin_idx] = None
+
+    def _propagate_row(self, p: np.ndarray, bin_idx: int, segment_seconds: float) -> np.ndarray:
+        eig = self._eigendecomp_by_bin_.get(bin_idx)
+        if eig is None:
+            try:
+                from scipy.linalg import expm
+            except ImportError as exc:
+                raise ImportError("scipy is required for temporal CTMC predictions") from exc
+            out = p @ expm(self.Q_by_bin_[bin_idx].to_numpy(dtype=float) * segment_seconds)
+        else:
+            eigvals, eigvecs, inv_eigvecs = eig
+            out = (p @ eigvecs * np.exp(eigvals * segment_seconds)) @ inv_eigvecs
+        return np.clip(np.real_if_close(out, tol=1000).real, 0.0, 1.0)
+
+    def _check_fit(self) -> None:
+        if not self.Q_by_bin_ or self.global_Q_ is None:
+            raise RuntimeError("Call fit() before using PiecewiseTimeVaryingTimeoutCTMC.")
 
 
 class ModelComparison:

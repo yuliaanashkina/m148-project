@@ -1,0 +1,2 @@
+model,n_snapshots,n_journeys,brier_score,log_loss,roc_auc,average_precision,mean_prob
+truncated_snapshot_kmeans_ctmc,100000,2305,0.12375306647195196,0.5033993190945866,0.7320651448342921,0.261633391940536,0.018613390294268846

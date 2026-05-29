@@ -52,6 +52,31 @@ Run CTMC submissions:
 python src/models/ctmc_submission.py
 ```
 
+Run the retained CTMC pipeline on the second open-journey test set:
+
+```powershell
+$TEST = "data\open_journeys2.csv"
+$SAMPLE = "data\open_journeys2_flattened_all0.csv"
+$OUT = "results\submissions\open_journeys2"
+$PREV = 0.04180
+
+python -m src.models.ctmc_pipeline suite --test-events $TEST --sample $SAMPLE --output-dir $OUT --n-clusters 3 --max-journeys 100000 --test-prevalence $PREV
+```
+
+The open_journeys2 all-zero Brier score is 0.04180, so use `--test-prevalence 0.04180` for prior calibration.
+
+Run the piecewise time-varying timeout CTMC:
+
+```powershell
+python -m src.models.ctmc_pipeline temporal --test-events $TEST --sample $SAMPLE --output-dir $OUT --max-journeys 100000 --test-prevalence $PREV
+```
+
+Run the timeout-aware spectral clustered CTMC:
+
+```powershell
+python -m src.models.ctmc_pipeline clustered --use-spectral-clustering --test-events $TEST --sample $SAMPLE --output-dir $OUT --n-clusters 3 --max-journeys 100000 --test-prevalence $PREV
+```
+
 Run tabular baseline submissions:
 
 ```powershell
